@@ -362,7 +362,7 @@ class NetworkDiagramGenerator:
                              member_is_used = member in self.used_addr_groups
                          
                          if member_is_used and member_node_prefix:
-                              # Ensure target node exists before adding edge
+                             # Ensure target node exists before adding edge
                              if f"{member_node_prefix}{member}" in self.processed_nodes:
                                   # Style: Group Membership (Address)
                                   self._add_edge(f"addrgrp_{name}", f"{member_node_prefix}{member}", 
@@ -2231,6 +2231,7 @@ class ConfigModel:
         self.system_fm        = {}                                         # FortiManager settings
         self.system_fortianalyzer = {}                                     # FortiAnalyzer settings
         self.system_fortisandbox = {}                                        # FortiSandbox settings
+        self.vdoms = {} # Dictionary to store VDOM-specific configurations
 
     def resolve_address(self, name):
         if name in self.addresses:
@@ -2308,22 +2309,29 @@ class FortiParser:
         self.model = ConfigModel()
 
     def parse(self):
-        print("DEBUG: Entering FortiParser.parse()") # DEBUG
-        if self.lines:
-             print(f"DEBUG: First few lines received: {self.lines[:5]}") # DEBUG
-        else:
-             print("DEBUG: No lines received by parser.") # DEBUG
-
-        # PROBLEM AREA: Why does the loop not seem to execute or print anything?
-        print(f"DEBUG: Starting main parse loop. self.i = {self.i}, len(lines) = {len(self.lines)}") # DEBUG
+        """Parse the config file and return a ConfigModel."""
+        self.i = 0
         while self.i < len(self.lines):
-            # print(f"DEBUG: Loop top: self.i = {self.i}") # DEBUG - Reduced verbosity
             line = self.lines[self.i].strip()
-            # print(f"DEBUG: Processing line {self.i+1}: '{line[:100]}...'") # DEBUG - Reduced verbosity
-            if not line or line.startswith('#'): # Skip empty lines and comments first
+            
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
                 self.i += 1
                 continue
-
+                
+            # Check for special VDOM or global configurations
+            if self.VDOM_CONFIG_RE.match(line):
+                print(f"DEBUG: Found VDOM config at line {self.i+1}")
+                self._handle_vdom_config()
+                self.model.has_vdoms = True
+                continue
+                
+            if self.GLOBAL_CONFIG_RE.match(line):
+                print(f"DEBUG: Found global config at line {self.i+1}")
+                self._handle_global_config()
+                continue
+                
+            # Regular section handling
             m = self.SECTION_RE.match(line)
             if m:
                 sec_raw = m.group(1).lower()
@@ -2337,7 +2345,7 @@ class FortiParser:
                     handler_name = f"_handle_{sec}"
                 # --- End Alias Map ---
 
-                print(f"DEBUG: Matched section '{sec_raw}' (Handler: {handler_name}) at line {self.i+1}.") # DEBUG
+                print(f"DEBUG: Matched section '{sec_raw}' (Handler: {handler_name}) at line {self.i+1}. Current VDOM: {self.current_vdom}") # DEBUG
                 handler = getattr(self, handler_name, None) # Use the determined handler_name
 
                 if handler:
@@ -2358,10 +2366,9 @@ class FortiParser:
                              print(f"Error trying to skip block after handler error: {skip_e}. Aborting.")
                              raise # Re-raise original error if skip fails catastrophically
                 else:
-                    # Fallback for unrecognized sections (even after alias check)
-                    print(f"Warning: Skipping unrecognized or unhandled section: {sec_raw} (Normalized: {sec}) at line {self.i+1}", file=sys.stderr)
-                    self._skip_block()
-                    print(f"DEBUG: Successfully skipped block (unhandled section). self.i is now {self.i}") # DEBUG
+                    # Use generic handler for unrecognized sections
+                    print(f"Warning: Using generic handler for unrecognized section: {sec_raw} (Normalized: {sec}) at line {self.i+1}", file=sys.stderr)
+                    self._handle_generic_section(sec_raw, sec)
             else:
                 # If the line is NOT a section start, AND not empty/comment
                 print(f"DEBUG: Skipping non-section line {self.i+1}: {line[:80]}...") # DEBUG
@@ -4133,6 +4140,73 @@ class FortiParser:
         self.model.system_fortisandbox.update(settings)
         if self.i < len(self.lines) and self.END_RE.match(self.lines[self.i].strip()): self.i += 1
 
+
+    # Generic section handler for unknown config sections
+    def _handle_generic_section(self, raw_section_name, normalized_section_name):
+        """
+        Generic handler for unrecognized configuration sections.
+        Stores entries in a dictionary under model.unhandled_sections.
+        
+        Args:
+            raw_section_name: The original section name from the config
+            normalized_section_name: The section name with spaces/hyphens replaced by underscores
+        """
+        print(f"DEBUG: Generic handler for section '{raw_section_name}'")
+        
+        # Initialize unhandled_sections dict if not exists
+        if not hasattr(self.model, 'unhandled_sections'):
+            self.model.unhandled_sections = {}
+            
+        # Create section container if not exists
+        if normalized_section_name not in self.model.unhandled_sections:
+            self.model.unhandled_sections[normalized_section_name] = {}
+            
+        # Determine where to store this section's data
+        target_dict = self.model.unhandled_sections[normalized_section_name]
+        
+        # Handle VDOM context if present
+        if self.current_vdom:
+            if 'vdom_specific' not in target_dict:
+                target_dict['vdom_specific'] = {}
+            if self.current_vdom not in target_dict['vdom_specific']:
+                target_dict['vdom_specific'][self.current_vdom] = []
+            entries_list = target_dict['vdom_specific'][self.current_vdom]
+        else:
+            if 'entries' not in target_dict:
+                target_dict['entries'] = []
+            entries_list = target_dict['entries']
+        
+        self.i += 1  # Consume 'config ...' line
+        
+        # Try to determine the type of section (edit-blocks vs settings-only)
+        try:
+            # Look ahead to see if we have 'edit' commands
+            has_edit_blocks = False
+            peek_i = self.i
+            while peek_i < len(self.lines) and not self.END_RE.match(self.lines[peek_i].strip()):
+                if self.EDIT_RE.match(self.lines[peek_i].strip()):
+                    has_edit_blocks = True
+                    break
+                peek_i += 1
+                
+            if has_edit_blocks:
+                # Process edit blocks for this section
+                while self.i < len(self.lines) and not self.END_RE.match(self.lines[self.i].strip()):
+                    blk = self._read_block()
+                    if blk:
+                        entries_list.append(blk)
+            else:
+                # Process as settings-only section
+                settings = self._read_settings()
+                entries_list.append(settings)
+                
+        except Exception as e:
+            print(f"Error in generic handler for '{raw_section_name}': {e}. Skipping section.", file=sys.stderr)
+            self._skip_block()
+            
+        # Consume the final 'end'
+        if self.i < len(self.lines) and self.END_RE.match(self.lines[self.i].strip()):
+            self.i += 1
 
 def print_table(title, headers, rows):
     """Print an ASCII table given headers and rows of data."""
