@@ -23,6 +23,8 @@ class ConfigModel:
         self.dhcp_servers      = []
         self.ospf              = {}
         self.bgp               = {}
+        self.bgp_neighbors     = []
+        self.bgp_networks      = []
         self.phase1            = {}
         self.phase2            = {}
         self.traffic_shapers   = {}
@@ -41,6 +43,7 @@ class ConfigModel:
         self.vrrp              = {}
         
         # New sections
+        self.policy_routes     = []
         self.system_global     = {}  # Global system settings
         self.antivirus        = {}  # Antivirus profiles
         self.ips              = {}  # IPS profiles
@@ -110,8 +113,19 @@ class ConfigModel:
         self.system_fortisandbox = {}                                        # FortiSandbox settings
         self.vdoms = {} # Dictionary to store VDOM-specific configurations
         self.has_vdoms = False # Flag to indicate if VDOMs were parsed
+        self.fortios_version = None # e.g., "v7.2.5,build1517"
+        self.fortios_version_details = {} # e.g., {'major': 7, 'minor': 2, 'patch': 5, 'build': 1517}
 
-    def resolve_address(self, name):
+    def resolve_address(self, name: str) -> list:
+        """Recursively resolves an address object or group name to a list of subnets.
+
+        Args:
+            name: The name of the address object or address group.
+
+        Returns:
+            A list of IP network strings (e.g., '192.168.1.0/24'). Returns an
+            empty list if the name cannot be resolved.
+        """
         if name in self.addresses:
             return [self.addresses[name]['subnet']]
         if name in self.addr_groups:
@@ -121,7 +135,16 @@ class ConfigModel:
             return out
         return []
 
-    def resolve_service(self, name):
+    def resolve_service(self, name: str) -> list:
+        """Recursively resolves a service object or group name to a list of services.
+
+        Args:
+            name: The name of the service object or service group.
+
+        Returns:
+            A list of service strings (e.g., 'TCP/80'). Returns an empty list
+            if the name cannot be resolved.
+        """
         if name in self.services:
             svc = self.services[name]
             return [f"{svc['protocol']}/{svc['port']}"]
@@ -132,7 +155,18 @@ class ConfigModel:
             return out
         return []
 
-    def expand_policy(self, pol):
+    def expand_policy(self, pol: dict) -> dict:
+        """Expands a policy dictionary by resolving address/service objects and groups.
+
+        Adds 'src_subnets', 'dst_subnets', and 'services_expanded' keys with
+        resolved values. Also adds 'poolname' if IP pooling is enabled.
+
+        Args:
+            pol: The original policy dictionary.
+
+        Returns:
+            A new dictionary representing the expanded policy.
+        """
         ep = pol.copy()
         ep['src_subnets'] = []
         for a in pol['srcaddr']:
