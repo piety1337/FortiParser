@@ -8,13 +8,261 @@ import ipaddress
 import sys
 from graphviz import Digraph
 # Import ConfigModel if needed for type hinting or direct access (adjust path as necessary)
-# from config_model import ConfigModel 
+# from config_model import ConfigModel
+import logging # Add logging import
+
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- ConfigAuditor Class (New) ---
+class ConfigAuditor:
+    """Performs analysis and auditing checks on the parsed configuration."""
+
+    def __init__(self, model):
+        self.model = model # Expects an instance of ConfigModel
+        self.findings = [] # List to store audit results: {'severity': '...', 'category': '...', 'message': '...', 'object': '...'}
+
+        # Define known insecure services (can be expanded)
+        self.INSECURE_SERVICES = {'TELNET', 'FTP', 'HTTP'} # Case-insensitive check later
+        self.WEAK_CRYPTO_P1 = {'des', 'md5', 'sha1', 'dhgrp1', 'dhgrp2', 'dhgrp5'} # Lowercase
+        self.WEAK_CRYPTO_P2 = {'des', 'null', 'md5', 'sha1'} # Lowercase
+
+    def run_audit(self):
+        """Runs all audit checks and populates self.findings."""
+        self.findings = [] # Reset findings for each run
+        logging.info("Starting configuration audit...")
+
+        self._audit_policies()
+        self._audit_objects()
+        self._audit_vpn()
+        self._audit_best_practices()
+        # Add calls to other audit methods here as they are implemented
+
+        logging.info(f"Audit complete. Found {len(self.findings)} potential issues.")
+        return self.findings
+
+    def _add_finding(self, severity, category, message, obj_name=None):
+        """Adds a finding to the list."""
+        self.findings.append({
+            'severity': severity, # e.g., 'Critical', 'High', 'Medium', 'Low', 'Info'
+            'category': category, # e.g., 'Policy', 'VPN', 'Best Practice', 'Object'
+            'message': message,
+            'object': obj_name # Name/ID of the affected configuration item
+        })
+
+    def _audit_policies(self):
+        """Audits firewall policies for potential issues."""
+        logging.debug("Auditing firewall policies...")
+        if not hasattr(self.model, 'policies'):
+             logging.warning("Audit Policies: No policies found in the model.")
+             return
+
+        # Cache resolved services to avoid repeated lookups (if DiagramGenerator isn't handy)
+        resolved_service_cache = {}
+
+        for policy in self.model.policies:
+            policy_id = policy.get('id', 'N/A')
+            if policy.get('status') == 'disable': continue # Skip disabled policies
+
+            # Check for overly permissive rules ('any'/'all')
+            src_addr = policy.get('srcaddr', [])
+            dst_addr = policy.get('dstaddr', [])
+            services = policy.get('service', [])
+            src_intf = policy.get('srcintf', [])
+            dst_intf = policy.get('dstintf', [])
+
+            is_any_src_addr = any(a.lower() in ['any', 'all'] for a in src_addr)
+            is_any_dst_addr = any(a.lower() in ['any', 'all'] for a in dst_addr)
+            is_any_service = any(s.upper() in ['ANY', 'ALL'] for s in services)
+
+            if is_any_src_addr and is_any_dst_addr and is_any_service:
+                self._add_finding('High', 'Policy', f"Policy uses 'any'/'all' for Source Address, Destination Address, and Service.", policy_id)
+            elif is_any_src_addr and is_any_dst_addr:
+                self._add_finding('Medium', 'Policy', f"Policy uses 'any'/'all' for both Source and Destination Address.", policy_id)
+            elif is_any_src_addr and is_any_service:
+                 self._add_finding('Medium', 'Policy', f"Policy uses 'any'/'all' for Source Address and Service.", policy_id)
+            elif is_any_dst_addr and is_any_service:
+                 self._add_finding('Medium', 'Policy', f"Policy uses 'any'/'all' for Destination Address and Service.", policy_id)
+            # Could add checks for individual 'any' uses if desired (lower severity)
+
+            # Check for policies without logging
+            log_traffic = policy.get('logtraffic', 'disable') # Default to disable if not present
+            if log_traffic == 'disable' or log_traffic == 'utm': # 'utm' only logs security events, not all traffic
+                self._add_finding('Medium', 'Policy', f"Traffic logging is disabled or limited to UTM events. Consider enabling 'all' for visibility.", policy_id)
+
+            # Check for use of insecure services (requires service resolution helper)
+            # This is complex without access to the diagram generator's resolver. We'll do a basic name check.
+            for svc_name in services:
+                if svc_name.upper() in self.INSECURE_SERVICES:
+                     self._add_finding('High', 'Policy', f"Policy allows potentially insecure service: '{svc_name}'. Ensure encryption/alternatives are used if possible.", policy_id)
+                     break # Only flag once per policy for this check
+
+            # Check for missing common UTM profiles on likely internet-facing policies
+            # Heuristic: If destination interface is WAN-like and service is common (HTTP/S)
+            # This is a very basic heuristic and needs refinement based on interface roles/names.
+            likely_wan_policy = False
+            if any(i.lower().startswith(('wan', 'port', 'virtual-wan-link')) for i in dst_intf):
+                 if any(s.upper() in ['HTTP', 'HTTPS', 'ALL', 'ANY'] for s in services):
+                       likely_wan_policy = True
+
+            if likely_wan_policy:
+                 missing_profiles = []
+                 if not policy.get('av_profile'): missing_profiles.append("Antivirus")
+                 if not policy.get('webfilter_profile'): missing_profiles.append("Web Filter")
+                 if not policy.get('ips_sensor'): missing_profiles.append("IPS")
+                 if not policy.get('application_list'): missing_profiles.append("Application Control")
+                 # Add check for ssl_ssh_profile if HTTPS is allowed?
+
+                 if missing_profiles:
+                      self._add_finding('Medium', 'Policy', f"Policy appears internet-facing but lacks security profiles: {', '.join(missing_profiles)}.", policy_id)
+
+    def _audit_objects(self):
+        """Audits configuration objects (addresses, services) for potential issues."""
+        logging.debug("Auditing configuration objects...")
+
+        # Check for vague address/group names
+        vague_patterns = ['test', 'temp', 'tmp', 'new', 'delete']
+        for addr_name in list(self.model.addresses.keys()) + list(self.model.addr_groups.keys()):
+             if isinstance(addr_name, str): # Ensure it's a string before lowercasing
+                 for pattern in vague_patterns:
+                     if pattern in addr_name.lower():
+                          obj_type = "Address" if addr_name in self.model.addresses else "Address Group"
+                          self._add_finding('Low', 'Object Naming', f"{obj_type} name '{addr_name}' may be temporary or unclear. Consider renaming.", addr_name)
+                          break # Check next object
+
+        # Check for vague service/group names
+        for svc_name in list(self.model.services.keys()) + list(self.model.svc_groups.keys()):
+             if isinstance(svc_name, str): # Ensure it's a string before lowercasing
+                 for pattern in vague_patterns:
+                     if pattern in svc_name.lower():
+                          obj_type = "Service" if svc_name in self.model.services else "Service Group"
+                          self._add_finding('Low', 'Object Naming', f"{obj_type} name '{svc_name}' may be temporary or unclear. Consider renaming.", svc_name)
+                          break
+
+        # Note: Unused object check is handled by generate_unused_report in NetworkDiagramGenerator
+
+    def _audit_vpn(self):
+        """Audits IPsec VPN configurations."""
+        logging.debug("Auditing VPN configurations...")
+
+        # Phase 1 Audit
+        for p1_name, p1_data in self.model.phase1.items():
+            if p1_data.get('status') == 'disable': continue
+
+            # Check Aggressive Mode (if applicable)
+            if p1_data.get('mode') == 'aggressive':
+                 self._add_finding('High', 'VPN', f"Phase 1 uses Aggressive Mode, which is less secure. Use Main Mode if possible.", p1_name)
+
+            # Check DPD
+            if p1_data.get('dpd') == 'disable':
+                 self._add_finding('Medium', 'VPN', f"Phase 1 has Dead Peer Detection (DPD) disabled. Enabling DPD helps detect dead tunnels.", p1_name)
+
+            # Check Proposals for weak crypto
+            proposals = p1_data.get('proposal', [])
+            if not isinstance(proposals, list): proposals = [proposals] # Handle single string case
+            weak_algos_found = set()
+            for prop_str in proposals:
+                 for weak_algo in self.WEAK_CRYPTO_P1:
+                     if weak_algo in prop_str.lower():
+                         weak_algos_found.add(weak_algo.upper())
+            if weak_algos_found:
+                 self._add_finding('High', 'VPN', f"Phase 1 proposal(s) '{' '.join(proposals)}' may use weak crypto/DH group(s): {', '.join(sorted(list(weak_algos_found)))}.", p1_name)
+
+        # Phase 2 Audit
+        for p2_name, p2_data in self.model.phase2.items():
+             # Assume P2 is relevant if its P1 is defined (status check not typical for P2 directly)
+             p1_ref = p2_data.get('phase1name')
+             if not p1_ref or p1_ref not in self.model.phase1: continue
+             if self.model.phase1[p1_ref].get('status') == 'disable': continue
+
+             # Check Proposals for weak crypto
+             proposals = p2_data.get('proposal', [])
+             if not isinstance(proposals, list): proposals = [proposals] # Handle single string case
+             weak_algos_found = set()
+             for prop_str in proposals:
+                 for weak_algo in self.WEAK_CRYPTO_P2:
+                     if weak_algo in prop_str.lower():
+                         weak_algos_found.add(weak_algo.upper())
+             if weak_algos_found:
+                  self._add_finding('High', 'VPN', f"Phase 2 proposal(s) '{' '.join(proposals)}' may use weak crypto: {', '.join(sorted(list(weak_algos_found)))}.", p2_name)
+
+             # Check PFS (Perfect Forward Secrecy)
+             if p2_data.get('pfs') == 'disable':
+                 self._add_finding('Medium', 'VPN', f"Phase 2 has Perfect Forward Secrecy (PFS) disabled. Enabling PFS enhances security.", p2_name)
+             elif p2_data.get('pfs') == 'enable':
+                  dh_group = p2_data.get('dhgrp') # Single value in P2
+                  if dh_group and dh_group.lower() in self.WEAK_CRYPTO_P1: # Reuse P1 weak DH groups
+                      self._add_finding('Medium', 'VPN', f"Phase 2 has PFS enabled but uses a potentially weak DH group: {dh_group}.", p2_name)
+
+
+    def _audit_best_practices(self):
+        """Audits general system settings against common best practices."""
+        logging.debug("Auditing system best practices...")
+
+        # Admin Access Best Practices
+        if self.model.system_global:
+            if self.model.system_global.get('admin-https-redirect') == 'disable':
+                self._add_finding('Medium', 'Best Practice', "HTTPS redirect for administrative access is disabled.", "system global")
+            # Check default ports (could compare against standard 80/443/22/23)
+            # admin_sport = self.model.system_global.get('admin-sport') # HTTP
+            # admin_https_port = self.model.system_global.get('admin-https-port') # HTTPS
+            # admin_ssh_port = self.model.system_global.get('admin-ssh-port') # SSH
+            # Check for insecure protocols enabled on admin interface (cannot check directly from global)
+
+        # Check WAN interface access (heuristic based on name/role)
+        for intf_name, intf_data in self.model.interfaces.items():
+            is_wan = intf_data.get('role') == 'wan' or intf_name.lower().startswith(('wan', 'port'))
+            if is_wan:
+                allow_access = intf_data.get('allowaccess', [])
+                insecure_wan_access = []
+                if 'http' in allow_access: insecure_wan_access.append('HTTP')
+                if 'telnet' in allow_access: insecure_wan_access.append('Telnet')
+                if 'ssh' in allow_access: insecure_wan_access.append('SSH') # SSH on WAN often discouraged
+                if 'snmp' in allow_access: insecure_wan_access.append('SNMP') # SNMP on WAN discouraged
+
+                if insecure_wan_access:
+                     self._add_finding('High', 'Best Practice', f"Potentially insecure administrative access enabled on WAN interface: {', '.join(insecure_wan_access)}.", intf_name)
+
+        # Check for default admin account (basic check)
+        if 'admin' in self.model.admins:
+             admin_data = self.model.admins['admin']
+             if not admin_data.get('password_policy'): # Check if a password policy is applied
+                 self._add_finding('High', 'Best Practice', "The default 'admin' account does not have a password policy assigned.", 'admin')
+             # Check trusted hosts for 'admin' - if empty or 0.0.0.0/0?
+             trusted_hosts = admin_data.get('trusted_hosts', [])
+             if not trusted_hosts or any('0.0.0.0 0.0.0.0' in th for th in trusted_hosts if isinstance(th, str)):
+                 self._add_finding('Medium', 'Best Practice', "The default 'admin' account has no or overly permissive trusted hosts configured.", 'admin')
+
+        # Check NTP Synchronization
+        if self.model.ntp and self.model.ntp.get('ntpsync') == 'disable':
+            self._add_finding('Medium', 'Best Practice', "NTP time synchronization is disabled. Accurate time is crucial for logs and certificates.", "system ntp")
+
+        # Check if remote logging is configured
+        log_targets = []
+        if self.model.system_fortianalyzer and self.model.system_fortianalyzer.get('status') == 'enable':
+            log_targets.append("FortiAnalyzer")
+        # Check syslog settings (more complex, need to check if any syslog server is enabled/configured)
+        syslog_settings = self.model.log_settings.get('syslogd', {}) # From specific handler
+        syslog_settings_generic = self.model.generic_configs.get('generic_log_syslogd_setting', {}).get('data', {}) # From generic handler
+
+        if syslog_settings.get('status') == 'enable' and syslog_settings.get('server'):
+            log_targets.append("Syslog")
+        elif syslog_settings_generic.get('status') == 'enable' and syslog_settings_generic.get('server'):
+             log_targets.append("Syslog")
+
+        if not log_targets:
+            self._add_finding('High', 'Best Practice', "No remote logging (FortiAnalyzer, Syslog) appears to be configured. Centralized logging is essential for security.", "Logging")
+
+# ... existing code ...
+# class ConfigAuditor: ... (as defined above)
 
 class NetworkDiagramGenerator:
     """Generates network topology diagrams from FortiGate configuration."""
     
     def __init__(self, model):
         self.model = model # Expects an instance of ConfigModel
+        self.auditor = ConfigAuditor(self.model) # Instantiate the auditor
+        self.audit_findings = [] # Store results after running audit
         self.graph = Digraph(comment='FortiGate Network Topology - Used Objects')
         self.graph.attr(rankdir='TB')  # Top to bottom layout for better network hierarchy
         self._setup_graph_attributes()
@@ -65,13 +313,14 @@ class NetworkDiagramGenerator:
         """Set up default graph styling with modern aesthetics."""
         # Global graph attributes for modern look
         self.graph.attr(
+            dpi='600',        # Set DPI for higher resolution
             compound='true',
             splines='spline',  # Use spline for smoother edges
             concentrate='false',  # Disable edge concentration for stability
             nodesep='0.5',    # Reduced spacing
             ranksep='0.7',    # Reduced spacing
             ratio='auto',     # Let graphviz determine the best ratio
-            size='8.5,11',    # Standard page size
+            size='612,792',    # Standard page size in points (8.5x11 inches * 72pt/inch)
             fontname='Helvetica',
             bgcolor='white',
             pad='0.2',
@@ -261,10 +510,12 @@ class NetworkDiagramGenerator:
             net = ipaddress.ip_network(subnet, strict=False)
             return f"NET:\n{net.compressed}"
         except ValueError:
+            # Print warning and return a placeholder label
+            print(f"Warning [Diagram]: Invalid subnet format '{subnet}' found. Cannot parse.", file=sys.stderr)
             # Could be FQDN, single IP, or something else
             if len(subnet) > 20: # Basic check for potentially long FQDNs
-                return f"ADDR:\n{subnet[:17]}..."
-            return f"ADDR:\n{subnet}"
+                return f"ADDR:\n{subnet[:17]}...\n(Parse Error)"
+            return f"ADDR:\n{subnet}\n(Parse Error)"
 
     def _expand_address_group(self, group_name):
         """Recursively expands address groups and adds nodes/edges."""
@@ -278,13 +529,13 @@ class NetworkDiagramGenerator:
         for member in members:
             if member in self.model.addr_groups: # Nested group
                 self._expand_address_group(member) # Ensure nested group node exists
-                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='contains')
+                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='Group Member ->', color='#999999', penwidth='0.8') # Lighter/Thinner
             elif member in self.model.addresses:
                 addr_obj = self.model.addresses[member]
                 label = self._get_subnet_label(addr_obj['subnet'])
                 tooltip = f"Type: {addr_obj.get('type', 'N/A')}\nSubnet: {addr_obj.get('subnet', 'N/A')}\nComment: {addr_obj.get('comment', '')}"
                 self._add_node(member, label=label, tooltip=tooltip, **self.NETWORK_STYLE)
-                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='contains')
+                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='Group Member ->', color='#999999', penwidth='0.8') # Lighter/Thinner
             else:
                 print(f"Warning: Address object '{member}' referenced in group '{group_name}' not found.", file=sys.stderr)
 
@@ -300,7 +551,7 @@ class NetworkDiagramGenerator:
         for member in members:
             if member in self.model.svc_groups: # Nested group
                 self._expand_service_group(member)
-                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='contains')
+                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='Group Member ->', color='#999999', penwidth='0.8') # Lighter/Thinner
             elif member in self.model.services:
                 svc_obj = self.model.services[member]
                 proto = svc_obj.get('protocol','?')
@@ -308,9 +559,9 @@ class NetworkDiagramGenerator:
                 label = f"SVC:\n{member}\n{proto}/{port}"
                 tooltip = f"Protocol: {proto}\nPort(s): {port}\nComment: {svc_obj.get('comment', '')}"
                 self._add_node(member, label=label, tooltip=tooltip, **self.SERVICE_STYLE)
-                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='contains')
+                self._add_edge(group_name, member, arrowhead='empty', style='dashed', label='Group Member ->', color='#999999', penwidth='0.8') # Lighter/Thinner
             else:
-                print(f"Warning: Service object '{member}' referenced in group '{group_name}' not found.", file=sys.stderr) 
+                print(f"Warning: Service object '{member}' referenced in group '{group_name}' not found.", file=sys.stderr)
 
     def generate_zones(self):
         """Generate zone clusters and place interfaces inside them."""
@@ -330,7 +581,13 @@ class NetworkDiagramGenerator:
                         if intf_name in self.used_interfaces:
                             intf_data = self.model.interfaces.get(intf_name, {})
                             label = f"INTF:\n{intf_name}\n{intf_data.get('ip', 'DHCP/Unset')}"
-                            tooltip = f"Alias: {intf_data.get('alias', 'N/A')}\nRole: {intf_data.get('role', 'N/A')}\nVDOM: {intf_data.get('vdom', 'N/A')}"
+                            tooltip_parts = [
+                                f"Alias: {intf_data.get('alias', 'N/A')}",
+                                f"Desc: {intf_data.get('description', 'N/A')}", # Added Description
+                                f"Role: {intf_data.get('role', 'N/A')}",
+                                f"VDOM: {intf_data.get('vdom', 'N/A')}"
+                            ]
+                            tooltip = "\n".join(tooltip_parts)
                             # Use a unique node ID within the cluster context
                             node_id = f"{zone_name}_{intf_name}" 
                             # Add node using the subgraph context
@@ -407,7 +664,7 @@ class NetworkDiagramGenerator:
                  self._add_node(route_id, label=label, tooltip=tooltip, **self.ROUTE_STYLE)
                  
                  # Connect route TO the interface
-                 self._add_edge(route_id, interface_node_id, label='uses', style='dashed', dir='forward')
+                 self._add_edge(route_id, interface_node_id, label='Egresses Via Interface', style='bold', dir='forward') # Changed label & style
 
                  # Connect route to destination (if destination is a drawn node)
                  self._connect_route_to_destination(route_id, dst)
@@ -418,24 +675,25 @@ class NetworkDiagramGenerator:
         if destination_str in self.model.addresses or destination_str in self.model.addr_groups:
              # If the object/group node exists (was used elsewhere), connect to it
              if destination_str in self.processed_nodes:
-                 self._add_edge(route_id, destination_str, label='to', style='dotted', constraint='false')
+                 self._add_edge(route_id, destination_str, label='Route Towards', style='bold,dashed', constraint='false') # Changed label & style
              # else: Dest object/group exists in config but wasn't used by a policy, so no node drawn.
              #       We could potentially draw it here if desired.
         else:
              # Assume it's a subnet/IP
              try:
                  # Generate the standard node ID for this subnet
-                 subnet_node_id = f"net_{ipaddress.ip_network(destination_str, strict=False).compressed}"
+                 net = ipaddress.ip_network(destination_str, strict=False)
+                 subnet_node_id = f"net_{net.compressed}"
                  # If the subnet node exists (e.g., from a direct connection), connect to it
                  if subnet_node_id in self.processed_nodes:
-                     self._add_edge(route_id, subnet_node_id, label='to', style='dotted', constraint='false')
+                     self._add_edge(route_id, subnet_node_id, label='Route Towards', style='bold,dashed', constraint='false') # Changed label & style
                  else:
                      # Subnet node doesn't exist. Create it now.
-                     subnet_label = self._get_subnet_label(destination_str)
+                     subnet_label = f"NET:\n{net.compressed}"
                      self._add_node(subnet_node_id, label=subnet_label, **self.NETWORK_STYLE)
-                     self._add_edge(route_id, subnet_node_id, label='to', style='dotted', constraint='false')
+                     self._add_edge(route_id, subnet_node_id, label='Route Towards', style='bold,dashed', constraint='false') # Changed label & style
              except ValueError:
-                 print(f"Warning: Could not parse destination '{destination_str}' for route '{route_id}' as object or subnet.", file=sys.stderr)
+                 print(f"Warning [Diagram]: Could not parse destination '{destination_str}' for route '{route_id}' as object or subnet.", file=sys.stderr)
 
     def generate_vips(self):
         """Generate nodes for used VIP objects and groups."""
@@ -470,10 +728,10 @@ class NetworkDiagramGenerator:
                           # Check if mapped IP string is an address object name
                           if mapip in self.model.addresses:
                               if mapip in self.processed_nodes:
-                                   self._add_edge(vip_name, mapip, label='maps to', style='dashed', constraint='false')
+                                   self._add_edge(vip_name, mapip, label='VIP Maps To ->', style='dashed', constraint='false') # Changed label
                           elif mapip in self.model.addr_groups:
                               if mapip in self.processed_nodes:
-                                  self._add_edge(vip_name, mapip, label='maps to', style='dashed', constraint='false')
+                                  self._add_edge(vip_name, mapip, label='VIP Maps To ->', style='dashed', constraint='false') # Changed label
                           else:
                               # Try adding as a network node if it looks like an IP/subnet
                               try:
@@ -481,10 +739,11 @@ class NetworkDiagramGenerator:
                                    subnet_node_id = f"net_{net.compressed}"
                                    if subnet_node_id not in self.processed_nodes:
                                        self._add_node(subnet_node_id, label=self._get_subnet_label(mapip), **self.NETWORK_STYLE)
-                                   self._add_edge(vip_name, subnet_node_id, label='maps to', style='dashed', constraint='false')
+                                   self._add_edge(vip_name, subnet_node_id, label='VIP Maps To ->', style='dashed', constraint='false') # Changed label
                               except ValueError:
-                                  print(f"Warning: Cannot resolve or draw mapped IP '{mapip}' for VIP '{vip_name}' as object or subnet.", file=sys.stderr)
-                              
+                                  # Error handled by the inner try/except for ipaddress.ip_network
+                                  pass
+
              # TODO: VIP Groups - if needed, similar expansion logic
 
     def generate_ip_pools(self):
@@ -549,18 +808,20 @@ class NetworkDiagramGenerator:
                 interface_node_id = self._find_interface_node_id(intf_name)
                 if interface_node_id: # Ensure interface node exists
                     try:
-                        iface = ipaddress.ip_interface(intf_data['ip'])
-                        network = iface.network
-                        net_label = self._get_subnet_label(str(network))
-                        net_node_id = f"net_{network.compressed}" # Unique ID for network node
-                        
-                        # Add network node if it doesn't exist
-                        if net_node_id not in self.processed_nodes:
-                            self._add_node(net_node_id, label=net_label, tooltip=f"Connected to {intf_name}", **self.NETWORK_STYLE)
-                        # Add edge from interface to its network
-                        self._add_edge(interface_node_id, net_node_id, arrowhead='none', style='bold')
+                         iface = ipaddress.ip_interface(intf_data['ip'])
+                         if not isinstance(iface, (ipaddress.IPv4Interface, ipaddress.IPv6Interface)):
+                             raise ValueError("Parsed result is not an interface object")
+                         network = iface.network
+                         net_label = f"NET:\n{network.compressed}"
+                         net_node_id = f"net_{network.compressed}" # Unique ID for network node
+                         
+                         # Add network node if it doesn't exist
+                         if net_node_id not in self.processed_nodes:
+                             self._add_node(net_node_id, label=net_label, tooltip=f"Connected to {intf_name}", **self.NETWORK_STYLE)
+                         # Add edge from interface to its network
+                         self._add_edge(interface_node_id, net_node_id, arrowhead='none', style='bold')
                     except ValueError as e:
-                        print(f"Warning: Could not parse IP for interface '{intf_name}': {intf_data['ip']} - {e}", file=sys.stderr)
+                         print(f"Warning [Diagram]: Could not parse IP for interface '{intf_name}' ('{intf_data['ip']}'): {e}", file=sys.stderr)
                     
         # 4. Add routes (visually connected to interfaces and destinations)
         #    This should happen after interfaces and potential destination networks are drawn.
@@ -623,7 +884,7 @@ class NetworkDiagramGenerator:
                     pool_name = policy_data['poolname']
                     if pool_name in self.used_ippools and pool_name in self.processed_nodes:
                         # Connect policy to the pool node
-                        self._add_edge(policy_id, pool_name, label='uses NAT pool', style='dashed', color='#78909c', constraint='false')
+                        self._add_edge(policy_id, pool_name, label='Uses SNAT Pool', style='dashed', color='#78909c', constraint='false') # Changed label
                     # else: Warning should have been printed during analysis
 
     def generate_sd_wan(self):
@@ -640,6 +901,7 @@ class NetworkDiagramGenerator:
             sdwan_cluster.node(sdwan_main_node_id, label='SD-WAN\nLogic', tooltip='SD-WAN Configuration', **self.SD_WAN_STYLE)
             self.processed_nodes.add(sdwan_main_node_id)
             
+            
             # SD-WAN Members (Interfaces)
             members = self.model.sd_wan.get('members', [])
             if isinstance(members, list):
@@ -651,9 +913,9 @@ class NetworkDiagramGenerator:
                             # Connect the SD-WAN logic node to the member interface
                             gw = member.get('gateway', 'N/A')
                             priority = member.get('priority', 'N/A')
-                            tooltip = f"SD-WAN Member\nInterface: {intf_name}\nGateway: {gw}\nPriority: {priority}"
+                            tooltip = f"SD-WAN Member\\nInterface: {intf_name}\\nGateway: {gw}\\nPriority: {priority}"
                             # Edge from interface TO sd-wan logic node, indicating participation
-                            self._add_edge(interface_node_id, sdwan_main_node_id, label='member', tooltip=tooltip, style='bold', color='#7cb342')
+                            self._add_edge(interface_node_id, sdwan_main_node_id, label='SD-WAN Member Interface', tooltip=tooltip, style='bold', color='#7cb342') # Changed label
             
             # SD-WAN Rules (Policies/Services)
             rules = self.model.sd_wan.get('service', [])
@@ -662,14 +924,14 @@ class NetworkDiagramGenerator:
                     rule_id_num = rule.get('id')
                     rule_name = rule.get('name', f'Rule {rule_id_num}')
                     rule_node_id = f"sdwan_rule_{rule_id_num}"
-                    label = f"SD-WAN Rule:\n{rule_name}"
-                    tooltip = f"ID: {rule_id_num}\nName: {rule_name}\nMode: {rule.get('mode', '?')}\nInput: {rule.get('input_device', '?')}"
+                    label = f"SD-WAN Rule:\\n{rule_name}"
+                    tooltip = f"ID: {rule_id_num}\\nName: {rule_name}\\nMode: {rule.get('mode', '?')}\\nInput: {rule.get('input_device', '?')}"
                     # Add SD-WAN rule node inside the cluster
                     sdwan_cluster.node(rule_node_id, label=label, tooltip=tooltip, **self.POLICY_STYLE) # Reuse policy style
                     self.processed_nodes.add(rule_node_id)
                     
                     # Connect rule to the main SD-WAN logic node
-                    self._add_edge(sdwan_main_node_id, rule_node_id, label='contains rule', style='dotted', dir='none')
+                    self._add_edge(sdwan_main_node_id, rule_node_id, label='Applies Rule', style='dotted', dir='none') # Changed label
                     
                     # Optional: Connect rule to its destination addresses/services if drawn
                     # Example for destination address:
@@ -697,8 +959,8 @@ class NetworkDiagramGenerator:
                     p1_data = self.model.phase1[tunnel_name]
                     local_gw_intf = p1_data.get('interface')
                     remote_gw = p1_data.get('remote_gw')
-                    label = f"VPN Tunnel:\n{tunnel_name}"
-                    tooltip = f"Phase 1: {tunnel_name}\nLocal IF: {local_gw_intf}\nRemote GW: {remote_gw}\nProposal: {p1_data.get('proposal', '?')}"
+                    label = f"VPN Tunnel:\\n{tunnel_name}"
+                    tooltip = f"Phase 1: {tunnel_name}\\nLocal IF: {local_gw_intf}\\nRemote GW: {remote_gw}\\nProposal: {p1_data.get('proposal', '?')}"
                     
                     # Add Phase 1 node (representing the tunnel interface)
                     self._add_node(tunnel_name, label=label, tooltip=tooltip, **self.VPN_STYLE)
@@ -708,7 +970,7 @@ class NetworkDiagramGenerator:
                     if local_gw_intf in self.used_interfaces:
                         interface_node_id = self._find_interface_node_id(local_gw_intf)
                         if interface_node_id:
-                            self._add_edge(tunnel_name, interface_node_id, label='uses physical IF', style='dashed')
+                            self._add_edge(tunnel_name, interface_node_id, label='Uses Physical IF ->', style='dashed') # Changed label
                             
                     # Find and add associated Phase 2 selectors (if P2 name is marked as used)
                     for p2_name, p2_data in self.model.phase2.items():
@@ -717,13 +979,13 @@ class NetworkDiagramGenerator:
                              # Format selector info carefully (can be object names or subnets)
                              src_sel = p2_data.get('src_subnet') or p2_data.get('src_addr_type') # TODO: Refine based on parsed data
                              dst_sel = p2_data.get('dst_subnet') or p2_data.get('dst_addr_type')
-                             p2_label = f"P2: {p2_name}\nSrc: {src_sel}\nDst: {dst_sel}"
-                             tooltip = f"Phase 2: {p2_name}\nProposal: {p2_data.get('proposal', '?')}\nPFS: {p2_data.get('pfs', 'disable')}"
+                             p2_label = f"P2: {p2_name}\\nSrc: {src_sel}\\nDst: {dst_sel}"
+                             tooltip = f"Phase 2: {p2_name}\\nProposal: {p2_data.get('proposal', '?')}\\nPFS: {p2_data.get('pfs', 'disable')}"
                              # Add Phase 2 node inside the VPN cluster
                              vpn_cluster.node(p2_node_id, label=p2_label, tooltip=tooltip, **self.VPN_STYLE)
                              self.processed_nodes.add(p2_node_id)
                              # Connect P1 tunnel node to P2 selector node
-                             self._add_edge(tunnel_name, p2_node_id, label='defines policy', style='dotted', dir='none')
+                             self._add_edge(tunnel_name, p2_node_id, label='Tunnel Defines', style='dotted', dir='none') # Changed label
                              
                              # Optional: Connect P2 node to actual src/dst address objects if they are drawn
                              # self._connect_p2_selectors(p2_node_id, src_sel, dst_sel)
@@ -740,7 +1002,7 @@ class NetworkDiagramGenerator:
                     # Interface is used but not in a used zone and not yet drawn.
                     # Create it in the main graph.
                     label = f"INTF:\n{intf_name}\n{intf_data.get('ip', 'DHCP/Unset')}"
-                    tooltip = f"Alias: {intf_data.get('alias', 'N/A')}\nRole: {intf_data.get('role', 'N/A')}\nVDOM: {intf_data.get('vdom', 'N/A')}"
+                    tooltip = intf_data.get('description', intf_name) # Use description for tooltip, fallback to name
                     self._add_node(intf_name, label=label, tooltip=tooltip, **self.INTERFACE_STYLE)
 
     def generate_policies(self):
@@ -771,10 +1033,12 @@ class NetworkDiagramGenerator:
     def _connect_policy_endpoints(self, policy_data, direction, policy_id):
         """Connects a policy node to its source/destination interfaces, zones, or tunnels."""
         intf_key = f'{direction}intf' # srcintf or dstintf
-        edge_label_intf = f'{direction.upper()} Intf'
-        edge_label_zone = f'{direction.upper()} Zone'
-        edge_label_vpn = f'{direction.upper()} VPN'
-        color = '#4285f4' if direction == 'src' else '#34a853' # Blue for src, Green for dst
+        # Changed labels
+        edge_label_intf = f'Egress Via Interface' if direction == 'dst' else 'Ingress Via Interface'
+        edge_label_zone = f'Egress Via Zone' if direction == 'dst' else 'Ingress Via Zone'
+        edge_label_vpn = f'Egress Via VPN' if direction == 'dst' else 'Ingress Via VPN'
+        color = '#34a853' if direction == 'dst' else '#4285f4' # Green for dst, Blue for src
+        conn_style = 'solid' # Use solid lines for interface/zone/vpn connections
 
         for element_name in policy_data.get(intf_key, []):
             target_node_id = None
@@ -817,87 +1081,101 @@ class NetworkDiagramGenerator:
                 # print(f"Debug: Element '{element_name}' in {intf_key} of policy {policy_data['id']} is not a drawn zone, interface, or tunnel.")
                 continue
 
-            # Add the edge
+            # Add the edge (Use solid style)
             if direction == 'src':
-                 self._add_edge(target_node_id, policy_id, label=edge_label, color=conn_color)
+                 self._add_edge(target_node_id, policy_id, label=edge_label, color=conn_color, style=conn_style)
             else: # dst
-                 self._add_edge(policy_id, target_node_id, label=edge_label, color=conn_color)
+                 self._add_edge(policy_id, target_node_id, label=edge_label, color=conn_color, style=conn_style)
 
     def _connect_policy_addresses(self, policy_data, direction, policy_id):
         """Connects a policy node to its source/destination addresses, groups, or VIPs."""
         addr_key = f'{direction}addr' # srcaddr or dstaddr
-        edge_label = f'{direction.upper()} Addr'
-        color = '#ea4335' if direction == 'src' else '#fbbc05' # Red for src, Yellow for dst
+        # Changed labels
+        edge_label = f'Policy Dst: Addr/Grp/VIP' if direction == 'dst' else 'Policy Src: Addr/Grp'
+        color = '#fbbc05' if direction == 'dst' else '#ea4335' # Yellow for dst, Red for src
         vip_color = '#ab47bc' # Purple for VIPs
         any_color = '#bdbdbd' # Grey for Any
+        conn_style = 'dotted' # Use dotted for addr/svc
 
         for addr_name in policy_data.get(addr_key, []):
             target_node_id = None
             conn_color = color # Default color
-            
+            current_label = edge_label # Default label
+
             # Handle 'all' / 'any' case
             if addr_name.lower() == 'all' or addr_name.lower() == 'any':
                  target_node_id = "any_address"
                  if target_node_id not in self.processed_nodes:
                       self._add_node(target_node_id, label="ANY", **self.ANY_STYLE)
                  conn_color = any_color
+                 current_label = f'Policy Dst: Any' if direction == 'dst' else 'Policy Src: Any'
             # Check if it's a VIP (only relevant for destination)
             elif direction == 'dst' and addr_name in self.used_vips:
                  target_node_id = addr_name
-                 edge_label = 'to VIP'
+                 current_label = 'Policy Dst: VIP' # Specific label for VIPs
                  conn_color = vip_color
             # Check if it's a used Address Object or Group
             elif addr_name in self.used_addresses or addr_name in self.used_addr_groups:
                  target_node_id = addr_name
+                 # Label remains default 'Policy Src/Dst: Addr/Grp'
             else:
                 # Address object exists in config but wasn't marked as used elsewhere
                 # Or it doesn't exist at all (warning printed during analysis)
                 # print(f"Debug: Address/Group '{addr_name}' in {addr_key} of policy {policy_data['id']} not found in processed nodes.")
                 continue
-            
+
             # Ensure target node actually exists in the graph
             if target_node_id not in self.processed_nodes:
                  # print(f"Debug: Target node '{target_node_id}' for policy {policy_data['id']} address connection not found.")
                  continue
-                 
-            # Add the edge
+
+            # Add the edge (Use dotted style)
             if direction == 'src':
-                 self._add_edge(target_node_id, policy_id, label=edge_label, style='dotted', color=conn_color, constraint='false')
+                 self._add_edge(target_node_id, policy_id, label=current_label, style=conn_style, color=conn_color, constraint='false')
             else: # dst
-                 self._add_edge(policy_id, target_node_id, label=edge_label, style='dotted', color=conn_color, constraint='false')
+                 self._add_edge(policy_id, target_node_id, label=current_label, style=conn_style, color=conn_color, constraint='false')
 
     def _connect_policy_services(self, policy_data, policy_id):
         """Connects a policy node to its services/service groups."""
         svc_key = 'service'
-        edge_label = 'Allows Svc'
+        # Changed label
+        edge_label = 'Policy Allows: Svc/Grp'
         color = '#5c6bc0' # Service color (blue/purple)
         any_color = '#bdbdbd' # Grey for Any
-        
+        conn_style = 'dotted' # Use dotted for addr/svc
+
         for svc_name in policy_data.get(svc_key, []):
             target_node_id = None
             conn_color = color
-            
+            current_label = edge_label # Start with default
+            service_detail_str = ""
+
             # Handle 'ALL' / 'ANY' case
             if svc_name.upper() == 'ALL' or svc_name.upper() == 'ANY':
                  target_node_id = "any_service"
                  if target_node_id not in self.processed_nodes:
                       self._add_node(target_node_id, label="ANY Svc", **self.ANY_STYLE)
                  conn_color = any_color
+                 current_label = 'Policy Allows: Any Svc'
             # Check if it's a used Service Object or Group
             elif svc_name in self.used_services or svc_name in self.used_svc_groups:
                  target_node_id = svc_name
+                 # Resolve and format the service details for the edge label
+                 resolved_tuples = self._resolve_service_object(svc_name)
+                 service_detail_str = self._format_resolved_services(resolved_tuples)
+                 current_label = f"Allows: {service_detail_str}" # Update label with details
             else:
                 # Service object exists but wasn't marked used, or doesn't exist
                 # print(f"Debug: Service/Group '{svc_name}' in {svc_key} of policy {policy_data['id']} not found in processed nodes.")
                 continue
-                
+
             # Ensure target node exists
             if target_node_id not in self.processed_nodes:
                 # print(f"Debug: Target service node '{target_node_id}' for policy {policy_data['id']} connection not found.")
                  continue
-                 
-            # Add the edge (Policy -> Service)
-            self._add_edge(policy_id, target_node_id, label=edge_label, style='dotted', color=conn_color, constraint='false') 
+
+            # Add the edge (Policy -> Service, use dotted style)
+            self._add_edge(policy_id, target_node_id, label=current_label, style=conn_style, color=conn_color, constraint='false')
 
     # --- Analysis Methods --- 
 
@@ -1261,58 +1539,96 @@ class NetworkDiagramGenerator:
 
     # --- Reporting Methods --- 
 
-    def generate_unused_report(self, output_file):
-        """Generates a text file listing potentially unused objects."""
-        report_file = f"{output_file}_unused_report.txt"
+    def generate_unused_report(self, output_file_base):
+        """Identifies potentially unused objects and returns them as a dictionary.
+        Also writes a detailed report to a text file for reference.
+
+        Args:
+            output_file_base: The base name for the output text report file.
+        
+        Returns:
+            A dictionary containing lists of potentially unused object names keyed by type
+            (e.g., {'addresses': [...], 'addr_groups': [...], ...}).
+        """
+        # Ensure analysis is done first (although usually called after analyze_relationships)
+        if not hasattr(self, 'unused_addresses'): 
+            logging.warning("Unused object analysis hasn't been run. Running now.")
+            self._identify_unused_objects()
+
+        report_file = f"{output_file_base}_unused_report.txt"
         print(f"Generating unused objects report: {report_file}")
+        
+        # Prepare data for return
+        unused_data = {
+            "addresses": sorted(list(self.unused_addresses)),
+            "addr_groups": sorted(list(self.unused_addr_groups)),
+            "services": sorted(list(self.unused_services)),
+            "svc_groups": sorted(list(self.unused_svc_groups)),
+            "interfaces": sorted(list(self.unused_interfaces)),
+            "zones": sorted(list(self.unused_zones)),
+            "vips": sorted(list(self.unused_vips)),
+            "ippools": sorted(list(self.unused_ippools)),
+            "routes": sorted(list(self.unused_routes)),
+            "phase1": sorted(list(self.unused_phase1)),
+            "phase2": sorted(list(self.unused_phase2)),
+        }
+        total_unused = sum(len(items) for items in unused_data.values())
+
+        # Write detailed report to file
         try:
             with open(report_file, 'w', encoding='utf-8') as f:
-                f.write("--- Potentially Unused Configuration Objects ---\n")
-                f.write("Note: Usage analysis is based on enabled firewall policies, static routes referencing used interfaces,\
-")
-                f.write("      VPN tunnels referenced by policies, VIPs/NAT pools used in policies, and recursive group membership.\n")
-                f.write("      Built-in objects (like 'all', 'http') and certain virtual interfaces (like 'ssl.root') are excluded.\n")
-                f.write("      This report is a *guide*. Verify usage in dynamic routing, disabled policies, GUI settings, etc. before deleting.\n\n")
+                f.write("--- Potentially Unused Configuration Objects ---\\n")
+                f.write("Note: Usage analysis is based on enabled firewall policies, static routes referencing used interfaces,\\")
+                f.write("      VPN tunnels referenced by policies, VIPs/NAT pools used in policies, and recursive group membership.\\n")
+                f.write("      Built-in objects (like 'all', 'http') and certain virtual interfaces (like 'ssl.root') are excluded.\\n")
+                f.write("      This report is a *guide*. Verify usage in dynamic routing, disabled policies, GUI settings, etc. before deleting.\\n\\n")
                 
-                sections = {
-                    "Address Objects": self.unused_addresses,
-                    "Address Groups": self.unused_addr_groups,
-                    "Service Objects": self.unused_services,
-                    "Service Groups": self.unused_svc_groups,
-                    "Interfaces": self.unused_interfaces,
-                    "Zones": self.unused_zones,
-                    "Virtual IPs (VIPs)": self.unused_vips,
-                    "IP Pools": self.unused_ippools,
-                    "Static Routes": self.unused_routes,
-                    "VPN Phase 1 Tunnels": self.unused_phase1,
-                    "VPN Phase 2 Selectors": self.unused_phase2,
+                sections_map = {
+                    "addresses": "Address Objects",
+                    "addr_groups": "Address Groups",
+                    "services": "Service Objects",
+                    "svc_groups": "Service Groups",
+                    "interfaces": "Interfaces",
+                    "zones": "Zones",
+                    "vips": "Virtual IPs (VIPs)",
+                    "ippools": "IP Pools",
+                    "routes": "Static Routes",
+                    "phase1": "VPN Phase 1 Tunnels",
+                    "phase2": "VPN Phase 2 Selectors",
                 }
                 
-                total_unused = 0
-                for section_title, items in sections.items():
-                    sorted_items = sorted(list(items))
-                    if sorted_items:
-                        f.write(f"--- {section_title} ({len(sorted_items)}) ---\n")
-                        total_unused += len(sorted_items)
-                        for item in sorted_items:
-                            f.write(f"- {item}\n")
-                        f.write("\n")
+                for key, items in unused_data.items():
+                    if items:
+                        section_title = sections_map.get(key, key.capitalize())
+                        f.write(f"--- {section_title} ({len(items)}) ---\\n")
+                        for item in items:
+                            f.write(f"- {item}\\n")
+                        f.write("\\n")
                 
                 if total_unused == 0:
-                     f.write("No potentially unused objects identified based on current analysis scope.\n")
+                     f.write("No potentially unused objects identified based on current analysis scope.\\n")
                 else:
-                     f.write(f"Total potentially unused objects found: {total_unused}\n")
+                     f.write(f"Total potentially unused objects found: {total_unused}\\n")
                      
             print(f"Successfully wrote unused report to {report_file}")
         except OSError as e:
             print(f"Error writing unused report file {report_file}: {e}", file=sys.stderr)
+            logging.error(f"Error writing unused report file {report_file}: {e}")
+            
+        return unused_data # Return the structured data
 
     def generate_relationship_summary(self):
-        """Generates a text summary of key configuration relationships."""
-        summary = ["--- Configuration Relationship Summary ---"]
+        """Generates a dictionary summarizing key configuration relationships AND audit findings."""
+        summary_data = {
+            "parsed_counts": {},
+            "used_counts": {},
+            "grouping_complexity": {},
+            "high_usage_objects": { "interfaces": [], "addresses": [], "services": [] },
+            "unused_counts": {},
+            "audit_summary": {}
+        }
 
         # Object Counts (Based on initial parse)
-        summary.append("\n--- Object Counts (Parsed) ---")
         counts = {
             "Static Routes": len(self.model.routes),
             "Address Objects": len(self.model.addresses),
@@ -1329,14 +1645,12 @@ class NetworkDiagramGenerator:
             "VPN Phase2": len(self.model.phase2),
             "SD-WAN Members": len(self.model.sd_wan.get('members', [])),
             "SD-WAN Rules": len(self.model.sd_wan.get('service', [])),
-            # Add more counts as needed
         }
         for name, count in counts.items():
              if count > 0:
-                  summary.append(f"- {name}: {count}")
+                  summary_data["parsed_counts"][name] = count
 
         # Usage Counts (Based on analysis)
-        summary.append("\n--- Object Counts (Used & Drawn) ---")
         drawn_policy_count = sum(1 for node in self.processed_nodes if node.startswith('pol_'))
         used_counts = {
             "Enabled & Referenced Policies": drawn_policy_count,
@@ -1352,45 +1666,32 @@ class NetworkDiagramGenerator:
             "VPN Phase1 Tunnels": len(self.used_phase1),
             "VPN Phase2 Selectors": len(self.used_phase2),
         }
-        for name, count in used_counts.items():
-            summary.append(f"- {name}: {count}")
-            
+        summary_data["used_counts"] = used_counts
+
         # Grouping Complexity
-        summary.append("\n--- Grouping Complexity ---")
         addr_depths = self.relationship_stats.get('address_group_depth', {})
         svc_depths = self.relationship_stats.get('service_group_depth', {})
         max_addr_depth = max((d for d in addr_depths.values() if isinstance(d, int)), default=0)
         max_svc_depth = max((d for d in svc_depths.values() if isinstance(d, int)), default=0)
-        summary.append(f"- Max Address Group Nesting Depth: {max_addr_depth}")
-        summary.append(f"- Max Service Group Nesting Depth: {max_svc_depth}")
         addr_cycles = [name for name, depth in addr_depths.items() if depth == 'Cycle Detected']
         svc_cycles = [name for name, depth in svc_depths.items() if depth == 'Cycle Detected']
-        if addr_cycles:
-            summary.append(f"- WARNING: Cycle detected involving Address Group(s): {', '.join(addr_cycles)}")
-        if svc_cycles:
-            summary.append(f"- WARNING: Cycle detected involving Service Group(s): {', '.join(svc_cycles)}")
-            
+        summary_data["grouping_complexity"] = {
+            "max_address_group_depth": max_addr_depth,
+            "max_service_group_depth": max_svc_depth,
+            "address_group_cycles": addr_cycles,
+            "service_group_cycles": svc_cycles
+        }
+
         # High Usage Objects (Top 5)
-        summary.append("\n--- High Usage Objects (Referenced by most policies) ---")
         top_n = 5
-        # Interfaces/Zones/Tunnels
         endpoint_counts = sorted(self.relationship_stats.get('interface_policy_count', {}).items(), key=lambda item: item[1], reverse=True)
-        summary.append(f"  Interfaces/Zones/Tunnels:")
-        for item, count in endpoint_counts[:top_n]: summary.append(f"    - {item}: {count} policies")
-        if not endpoint_counts: summary.append("    (None)")
-        # Addresses/Groups/VIPs
         addr_counts = sorted(self.relationship_stats.get('address_policy_count', {}).items(), key=lambda item: item[1], reverse=True)
-        summary.append(f"  Addresses/Groups/VIPs:")
-        for item, count in addr_counts[:top_n]: summary.append(f"    - {item}: {count} policies")
-        if not addr_counts: summary.append("    (None)")
-        # Services/Groups
         svc_counts = sorted(self.relationship_stats.get('service_policy_count', {}).items(), key=lambda item: item[1], reverse=True)
-        summary.append(f"  Services/Groups:")
-        for item, count in svc_counts[:top_n]: summary.append(f"    - {item}: {count} policies")
-        if not svc_counts: summary.append("    (None)")
+        summary_data["high_usage_objects"]["interfaces"] = endpoint_counts[:top_n]
+        summary_data["high_usage_objects"]["addresses"] = addr_counts[:top_n]
+        summary_data["high_usage_objects"]["services"] = svc_counts[:top_n]
 
         # Unused Objects Summary
-        summary.append("\n--- Potentially Unused Objects Summary ---")
         unused_counts_summary = {
             "Address Objects": len(self.unused_addresses),
             "Address Groups": len(self.unused_addr_groups),
@@ -1407,71 +1708,163 @@ class NetworkDiagramGenerator:
         has_unused = False
         for name, count in unused_counts_summary.items():
              if count > 0:
-                  summary.append(f"- {name}: {count}")
+                  summary_data["unused_counts"][name] = count
                   has_unused = True
-        if not has_unused:
-             summary.append("(No potentially unused objects identified)")
-        else:
-            summary.append("(See separate unused report file for details)")
+        summary_data["unused_counts"]["_has_unused"] = has_unused # Flag for easier checking later
 
-        return "\n".join(summary)
+        # --- Add Audit Summary Section ---
+        audit_sev_counts = {}
+        if self.audit_findings:
+             for finding in self.audit_findings:
+                 sev = finding.get('severity', 'Unknown')
+                 audit_sev_counts[sev] = audit_sev_counts.get(sev, 0) + 1
+
+        summary_data["audit_summary"] = {
+            "total_findings": len(self.audit_findings) if self.audit_findings else 0,
+            "severity_counts": audit_sev_counts
+        }
+
+        return summary_data
+
+    # --- Add Audit Report Generation ---
+    def generate_audit_report(self, output_file):
+        """Generates a text file listing detailed audit findings."""
+        if not self.audit_findings:
+            logging.info("Skipping audit report generation: No findings.")
+            return
+
+        report_file = f"{output_file}_audit_report.txt"
+        logging.info(f"Generating audit report: {report_file}")
+        try:
+            # Sort findings by severity (e.g., Critical, High, Medium, Low, Info) then category
+            severity_order = {'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3, 'Info': 4, 'Unknown': 5}
+            sorted_findings = sorted(self.audit_findings,
+                                     key=lambda x: (severity_order.get(x.get('severity', 'Unknown'), 99),
+                                                    x.get('category', '')))
+
+            with open(report_file, 'w', encoding='utf-8') as f:
+                f.write("--- FortiGate Configuration Audit Report ---\n\n")
+                f.write(f"Generated for configuration based on: {self.model.fortios_version or 'Unknown Version'}\n")
+                f.write(f"Total Potential Issues Found: {len(sorted_findings)}\n\n")
+
+                last_category = None
+                for finding in sorted_findings:
+                    category = finding.get('category', 'General')
+                    if category != last_category:
+                        f.write(f"--- {category} Issues ---\n")
+                        last_category = category
+
+                    sev = finding.get('severity', 'Info')
+                    msg = finding.get('message', 'No details.')
+                    obj = finding.get('object')
+
+                    f.write(f"[{sev}]")
+                    if obj:
+                        f.write(f" (Object: {obj})")
+                    f.write(f": {msg}\n")
+                f.write("\n--- End of Report ---\n")
+                f.write("Note: This report provides automated checks based on common practices. Always verify findings in your specific environment.\n")
+
+            print(f"Successfully wrote audit report to {report_file}")
+        except OSError as e:
+            print(f"Error writing audit report file {report_file}: {e}", file=sys.stderr)
+            logging.error(f"Error writing audit report file {report_file}: {e}")
+        except Exception as e:
+             print(f"An unexpected error occurred during audit report generation: {e}", file=sys.stderr)
+             logging.error(f"An unexpected error occurred during audit report generation: {e}", exc_info=True)
 
     def generate_diagram(self, output_file='network_topology'):
-        """Generates the final network diagram focusing on used objects and relationships."""
-        print("Generating network diagram...")
-        # 1. Analyze relationships to identify used objects (must be done first)
-        self.analyze_relationships()
+        """Generates the final network diagram and associated reports.
+        Tries to render SVG first for better quality, falls back to PNG.
+        
+        Args:
+            output_file: The base name for the output files (without extension).
+            
+        Returns:
+            The path to the generated diagram file (SVG or PNG), or None if generation failed.
+        """
+        print("Analyzing configuration relationships...")
+        self.analyze_relationships() # Run usage analysis first
 
+        # --- Run Audit ---
+        print("Running configuration audit...")
+        self.audit_findings = self.auditor.run_audit() # Store findings
+
+        print("Generating network diagram components...")
         # 2. Generate nodes and clusters based on the analysis
-        # Order matters for visual grouping and dependencies.
-        # Basic network structure first:
-        self.generate_network_hierarchy() # Includes Zones, Interfaces, connected Networks, Routes
+        self.generate_network_hierarchy() 
+        self.generate_policies() 
+        self.generate_nat_configuration() 
+        self.generate_sd_wan() 
+        self.generate_vpn_tunnels() 
         
-        # Security elements:
-        self.generate_policies() # Includes Addr/Svc object nodes, Policy nodes, and connects them
-        
-        # NAT elements:
-        self.generate_nat_configuration() # Includes VIP/Pool nodes and connects policies
-        
-        # Other features:
-        self.generate_sd_wan() # Includes SD-WAN cluster, members, rules
-        self.generate_vpn_tunnels() # Includes VPN cluster, P1, P2 nodes
-        
-        # 3. Render the diagram
+        # 3. Generate the legend
+        self.generate_legend()
+
+        # 4. Render the diagram - Try SVG first, then PNG
         output_path = output_file
-        print(f"Attempting to render diagram to {output_path}.[png|svg]...")
+        rendered_file_path = None 
+        svg_success = False # Flag to track SVG outcome
+        print(f"Attempting to render diagram to {output_path}.svg...")
         try:
-            # Render PNG
-            png_filename = self.graph.render(output_path, format='png', view=False, cleanup=True)
-            print(f"Successfully generated PNG diagram: {png_filename}")
-            # Render SVG
+            # Try SVG rendering first
             svg_filename = self.graph.render(output_path, format='svg', view=False, cleanup=True)
             print(f"Successfully generated SVG diagram: {svg_filename}")
-        except Exception as e:
-            print(f"\nError rendering graph with Graphviz: {e}", file=sys.stderr)
-            print("Ensure Graphviz executables (dot) are installed and in your system's PATH.", file=sys.stderr)
-            # Attempt to save the DOT source file anyway for manual rendering
+            rendered_file_path = svg_filename # Prioritize SVG
+            svg_success = True
+        except Exception as e_svg:
+            # Ensure the error message is printed
+            print(f"\nWarning: SVG rendering failed. Error: {e_svg}. Falling back to PNG.", file=sys.stderr)
+            logging.warning(f"SVG rendering failed: {e_svg}", exc_info=True)
+            svg_success = False
+            
+        # --- Fallback to PNG if SVG failed --- 
+        if not svg_success:
+            print(f"Attempting to render diagram to {output_path}.png...")
             try:
-                 dot_filename = f"{output_path}.gv"
-                 self.graph.save(filename=dot_filename)
-                 print(f"Saved DOT source file for manual inspection/rendering: {dot_filename}")
-            except Exception as dot_e:
-                 print(f"Error saving DOT source file: {dot_e}", file=sys.stderr)
+                # Set higher DPI for PNG rendering
+                # Note: Some graphviz versions might need engine='dot' explicitly
+                self.graph.graph_attr['dpi'] = '300' # Reduced DPI to avoid DecompressionBomb
+                png_filename = self.graph.render(output_path, format='png', view=False, cleanup=True)
+                print(f"Successfully generated PNG diagram: {png_filename}")
+                rendered_file_path = png_filename
+            except Exception as e_png:
+                print(f"\nError: Both SVG and PNG rendering failed.", file=sys.stderr)
+                print(f"PNG Error: {e_png}", file=sys.stderr)
+                print("Ensure Graphviz executables (dot) are installed and in your system's PATH.", file=sys.stderr)
+                logging.error(f"PNG rendering failed: {e_png}", exc_info=True)
+                # Attempt to save the DOT source file anyway for manual rendering
+                try:
+                     dot_filename = f"{output_path}.gv"
+                     self.graph.save(filename=dot_filename)
+                     print(f"Saved DOT source file for manual inspection/rendering: {dot_filename}")
+                except Exception as dot_e:
+                     print(f"Error saving DOT source file: {dot_e}", file=sys.stderr)
+                     logging.error(f"Error saving DOT source file: {dot_e}", exc_info=True)
+                rendered_file_path = None # Ensure None is returned on complete failure
 
-        # 4. Generate the unused objects report
+        # 5. Generate the unused objects report (get data and write file)
         self.generate_unused_report(output_file)
         
-        # 5. Generate and print the relationship summary
-        summary = self.generate_relationship_summary()
-        print("\n" + summary)
-        # Optionally save summary to file
-        summary_file = f"{output_file}_summary.txt"
-        try:
-             with open(summary_file, 'w', encoding='utf-8') as f:
-                  f.write(summary)
-             print(f"Successfully saved relationship summary to {summary_file}")
-        except OSError as e:
-             print(f"Error writing summary file {summary_file}: {e}", file=sys.stderr)
+        # --- Generate the NEW Audit Report ---
+        self.generate_audit_report(output_file)
+        
+        # 6. Generate and print the relationship summary (Now handled in app.py)
+        # summary = self.generate_relationship_summary()
+        # print("\\n" + summary) # This line caused the TypeError
+        # Optionally save summary to file (Also handled in app.py or redundant)
+        # summary_file = f"{output_file}_summary.txt"
+        # try:
+        #      with open(summary_file, 'w', encoding='utf-8') as f:
+        #           # Need to format the dict back to string if saving here
+        #           # For now, let app.py handle display
+        #           f.write(str(summary)) # Crude conversion, better formatting needed if uncommented
+        #      print(f"Successfully saved relationship summary to {summary_file}")
+        # except OSError as e:
+        #      print(f"Error writing summary file {summary_file}: {e}", file=sys.stderr)
+        #      logging.error(f"Error writing summary file {summary_file}: {e}")
+             
+        return rendered_file_path # Return the path to SVG or PNG file (or None)
 
 
     # --- Path Tracing Logic --- 
@@ -1482,9 +1875,11 @@ class NetworkDiagramGenerator:
             ip = ipaddress.ip_address(ip_str)
             subnet = ipaddress.ip_network(subnet_str, strict=False)
             return ip in subnet
-        except ValueError:
-            # Handle cases where subnet_str might be FQDN or invalid
-            return False
+        except ValueError as e:
+            # Suppress printing errors here as this is often called speculatively
+            # print(f"Debug [_ip_in_subnet]: ValueError comparing '{ip_str}' and '{subnet_str}': {e}", file=sys.stderr)
+             # Handle cases where subnet_str might be FQDN or invalid
+             return False
 
     def _resolve_address_object(self, name, visited=None):
         """Recursively resolve an address object/group name to a list of network objects.
@@ -1510,7 +1905,7 @@ class NetworkDiagramGenerator:
                 try:
                     resolved.append(ipaddress.ip_network(subnet_val, strict=False))
                 except ValueError:
-                     print(f"Warning: Invalid IP/subnet '{subnet_val}' in address object '{name}'", file=sys.stderr)
+                     print(f"Warning [Resolve Addr]: Invalid IP/subnet format '{subnet_val}' in address object '{name}'.", file=sys.stderr)
             elif addr_type == 'iprange':
                  # Convert range to individual IPs or networks if possible (can be large!)
                  # Simplification for trace: treat range start as representative? Or return range tuple?
@@ -1523,7 +1918,8 @@ class NetworkDiagramGenerator:
                      # For routing check, maybe just the start IP?
                      resolved.append((start_ip, end_ip)) # Represent range as tuple for policy check
                  except ValueError:
-                     print(f"Warning: Invalid IP range format '{subnet_val}' in address object '{name}'", file=sys.stderr)
+                      # Improved error message for range parsing
+                      print(f"Warning [Resolve Addr]: Invalid IP range format '{subnet_val}' in address object '{name}'. Expected 'start_ip-end_ip'.", file=sys.stderr)
             elif addr_type == 'fqdn':
                  resolved.append(subnet_val) # Keep FQDN as string
             elif addr_type == 'wildcard': # Very difficult to resolve for path tracing
@@ -1631,7 +2027,7 @@ class NetworkDiagramGenerator:
         try:
             source_ip = ipaddress.ip_address(source_ip_str)
         except ValueError:
-            return None, f"Invalid source IP format: {source_ip_str}"
+            return None, f"[Trace Error] Invalid source IP format: '{source_ip_str}'"
         
         best_match_intf = None
         longest_prefix = -1
@@ -1646,6 +2042,8 @@ class NetworkDiagramGenerator:
                             longest_prefix = iface_network.prefixlen
                             best_match_intf = intf_name
                 except ValueError:
+                    # Log error if interface IP itself is invalid
+                    print(f"Warning [Trace]: Interface '{intf_name}' has invalid IP format '{intf_data['ip']}'. Skipping for source lookup.", file=sys.stderr)
                     continue # Ignore interfaces with invalid primary IP/mask
             
             # Check secondary IPs (if parsed and stored as a list)
@@ -1662,7 +2060,9 @@ class NetworkDiagramGenerator:
                                      longest_prefix = sec_network.prefixlen
                                      best_match_intf = intf_name
                          except ValueError:
-                             continue # Ignore invalid secondary IP
+                             # Log error if secondary IP is invalid
+                             print(f"Warning [Trace]: Interface '{intf_name}' has invalid secondary IP format '{sec_ip_str}'. Skipping.", file=sys.stderr)
+                continue # Ignore invalid secondary IP
         
         if best_match_intf:
              intf_ip = self.model.interfaces[best_match_intf].get('ip', '?')
@@ -1679,7 +2079,7 @@ class NetworkDiagramGenerator:
         try:
             dest_ip = ipaddress.ip_address(dest_ip_str)
         except ValueError:
-            return None, None, f"Invalid destination IP format: {dest_ip_str}"
+            return None, None, f"[Trace Error] Invalid destination IP format: '{dest_ip_str}'"
             
         best_match_route_info = None # Will store (route_type, route_data, prefixlen, distance)
         longest_prefix = -1
@@ -1709,7 +2109,8 @@ class NetworkDiagramGenerator:
                         best_match_route_info = ('static', route, prefixlen, distance)
             except ValueError:
                  # Destination might be an interface service or invalid
-                 continue 
+                 # print(f"Debug Route: Skipping route with unparsable destination: {dst_subnet_str}")
+                  continue 
                  
         # --- Check Connected Routes --- 
         # Connected routes have distance 0
@@ -1803,7 +2204,7 @@ class NetworkDiagramGenerator:
              check_src_ip = ipaddress.ip_address(src_ip_str)
              check_dst_ip = ipaddress.ip_address(dst_ip_str)
         except ValueError as e:
-             return None, f"Policy check failed: Invalid IP address - {e}"
+             return None, f"[Policy Check Error] Invalid source ('{src_ip_str}') or destination ('{dst_ip_str}') IP format: {e}"
              
         check_proto = protocol_str.lower()
         check_port = None
@@ -1814,7 +2215,7 @@ class NetworkDiagramGenerator:
              try:
                  check_port = int(dst_port_str)
              except (ValueError, TypeError):
-                 return None, f"Policy check failed: Invalid destination port '{dst_port_str}' for protocol {check_proto}"
+                 return None, f"[Policy Check Error] Invalid destination port format '{dst_port_str}' for protocol '{check_proto}'. Expected an integer."
         elif check_proto in ['icmp', 'icmp6']:
              # If tracing ICMP, dst_port_str might represent type/code
              # Example: dst_port_str="8:0" for echo request
@@ -2149,7 +2550,7 @@ class NetworkDiagramGenerator:
         current_proto = protocol
         
         final_status = "Trace initiated."
-        print(f"\n--- Starting Path Trace ---")
+        print(f"\\n--- Starting Path Trace ---")
         print(f"Initial Packet: {current_src_ip} -> {current_dst_ip}:{current_dst_port} (proto: {current_proto})")
         print(f"Max Hops: {max_hops}")
         print("-"*25)
@@ -2165,7 +2566,7 @@ class NetworkDiagramGenerator:
         # --- Simulation Loop (Max hops to prevent infinite loops) ---
         for hop_num in range(1, max_hops + 1):
             current_hop_num = hop_num
-            print(f"\nHop {current_hop_num}: State - Ingress='{ingress_intf}', Current='{current_intf}', Dst='{current_dst_ip}'")
+            print(f"\\nHop {current_hop_num}: State - Ingress='{ingress_intf}', Current='{current_intf}', Dst='{current_dst_ip}'")
             
             # --- 2. Routing Lookup --- 
             # Route lookup is based on the current destination IP
@@ -2290,7 +2691,7 @@ class NetworkDiagramGenerator:
             final_status = f"Stopped: Maximum hops ({max_hops}) exceeded during simulation."
             path.append({'hop': current_hop_num, 'type': 'Stopped', 'detail': final_status})
 
-        print(f"\n--- Trace Finished: {final_status} ---")
+        print(f"\\n--- Trace Finished: {final_status} ---")
         return path, final_status
 
 
@@ -2368,8 +2769,9 @@ class NetworkDiagramGenerator:
                  try:
                      network = ipaddress.ip_network(intf_data['ip'], strict=False)
                      network_info = f"Network: {network.with_netmask}"
-                 except ValueError:
+                 except ValueError as e:
                      network_info = "(Invalid IP format)"
+                     print(f"Warning [Connectivity Tree]: Invalid IP format for interface '{intf_name}' ('{intf_data['ip']}'): {e}", file=sys.stderr)
             details.append(f"{child_prefix}{connector}{network_info}")
             
             # Get Static Routes via this interface
@@ -2428,7 +2830,7 @@ class NetworkDiagramGenerator:
                                      if name not in interfaces_in_zones])
         num_standalone = len(standalone_interfaces)
         if standalone_interfaces:
-             output_lines.append("\n--- Interfaces Not in Zones ---")
+             output_lines.append("\\n--- Interfaces Not in Zones ---")
              for k, intf_name in enumerate(standalone_interfaces):
                  is_last_standalone = (k == num_standalone - 1)
                  # No zone prefix needed here, start directly
@@ -2436,3 +2838,158 @@ class NetworkDiagramGenerator:
                  processed_interfaces.add(intf_name)
 
         return "\n".join(output_lines)
+
+    def generate_legend(self):
+        """Generates a legend subgraph explaining node colors and edge styles."""
+        with self.graph.subgraph(name='cluster_legend') as legend:
+            legend.attr(label='Legend', rank='sink', style='dashed', color='grey', fontname='Helvetica Bold', fontsize='12', margin='10') # Reduced margin
+            # legend.attr(rankdir='LR') # Let graphviz decide best direction for compactness
+
+            # Node Type Explanations - Grouped for potential ranking
+            node_groups = [
+                [
+                    ('Interface', self.INTERFACE_STYLE),
+                    ('Network/Addr', self.NETWORK_STYLE),
+                    ('Policy', self.POLICY_STYLE),
+                    ('Route', self.ROUTE_STYLE),
+                    ('VIP', self.VIP_STYLE),
+                ],
+                [
+                    ('Group', self.GROUP_STYLE),
+                    ('Service', self.SERVICE_STYLE),
+                    ('IP Pool', self.POOL_STYLE),
+                    ('SD-WAN', self.SD_WAN_STYLE),
+                    ('VPN', self.VPN_STYLE),
+                    ('Any', self.ANY_STYLE),
+                ]
+            ]
+
+            all_legend_node_ids = []
+            for group in node_groups:
+                group_node_ids = []
+                for label, style in group:
+                    node_id = f'legend_{label.lower().replace("/", "_").replace(" ", "_")}'
+                    # Apply base style and override fillcolor etc. Use smaller size.
+                    attrs = {**self.graph.node_attr, **style, 'label': label,
+                             'fontsize': '8', 'height':'0.3', 'width':'0.8', 'margin':'0.1'} # Smaller node
+                    legend.node(node_id, **attrs)
+                    group_node_ids.append(node_id)
+                    all_legend_node_ids.append(node_id)
+                # Apply same rank to nodes within a group
+                if len(group_node_ids) > 1:
+                    legend.attr('graph', rank='same') # Apply rank=same within this subgraph context
+                    # Add invisible edges between nodes in the group to hint at order
+                    for i in range(len(group_node_ids) - 1):
+                         legend.edge(group_node_ids[i], group_node_ids[i+1], style='invis')
+
+            # Edge Style Explanations (using dummy nodes within legend cluster)
+            # Use a subgraph to group edge explanations visually if needed
+            with legend.subgraph(name="cluster_legend_edges") as edge_legend:
+                edge_legend.attr(label="Common Edge Styles", style='invis', fontname='Helvetica', fontsize='10')
+                # edge_legend.attr(rank='sink') # Try to put edges below nodes
+
+                edge_node_ids = []
+                edge_styles = [
+                    ('edge1', ' Interface -> Network (Bold/Solid)', {'style':'bold', 'arrowhead':'none'}),
+                    ('edge2', ' Group -> Member (Dashed)', {'style':'dashed', 'arrowhead':'empty'}),
+                    ('edge3', ' Policy -> Object (Dotted)', {'style':'dotted', 'constraint':'false'}),
+                    ('edge4', ' Route -> IF/Net (Bold)', {'style':'bold', 'dir':'forward'}),
+                    ('edge5', ' Policy -> IF/Zone/VPN (Solid)', {'style':'solid'})
+                ]
+
+                for i, (base_id, label, edge_attrs) in enumerate(edge_styles):
+                    start_id = f'ledge_{base_id}_start'
+                    end_id = f'ledge_{base_id}_end'
+                    edge_legend.node(start_id, label='', shape='point', width='0.01', height='0.01')
+                    edge_legend.node(end_id, label='', shape='point', width='0.01', height='0.01')
+                    # Add specific edge attributes, use smaller font
+                    final_edge_attrs = {**self.graph.edge_attr, **edge_attrs, 'label': label, 'fontsize': '7'}
+                    edge_legend.edge(start_id, end_id, **final_edge_attrs)
+                    edge_node_ids.extend([start_id, end_id])
+                
+                # Try ranking edge explanation nodes together
+                # edge_legend.attr('graph', rank='same')
+                # for i in range(0, len(edge_node_ids) - 2, 2):
+                #     edge_legend.edge(edge_node_ids[i+1], edge_node_ids[i+2], style='invis') # Link end of one pair to start of next
+
+
+    def generate_diagram(self, output_file='network_topology'):
+        """Generates the final network diagram focusing on used objects and relationships."""
+        print("Generating network diagram...")
+        # 1. Analyze relationships to identify used objects (must be done first)
+        self.analyze_relationships()
+
+        # 2. Generate nodes and clusters based on the analysis
+        # Order matters for visual grouping and dependencies.
+        # Basic network structure first:
+        self.generate_network_hierarchy() # Includes Zones, Interfaces, connected Networks, Routes
+        
+        # Security elements:
+        self.generate_policies() # Includes Addr/Svc object nodes, Policy nodes, and connects them
+        
+        # NAT elements:
+        self.generate_nat_configuration() # Includes VIP/Pool nodes and connects policies
+        
+        # Other features:
+        self.generate_sd_wan() # Includes SD-WAN cluster, members, rules
+        self.generate_vpn_tunnels() # Includes VPN cluster, P1, P2 nodes
+        
+        # 3. Generate the legend
+        self.generate_legend()
+
+        # 4. Render the diagram
+        output_path = output_file
+        rendered_file_path = None # Initialize return value
+        print(f"Attempting to render diagram to {output_path}.[png|svg]...")
+        try:
+            # Render PNG first as it's more likely to be displayable in Streamlit
+            png_filename = self.graph.render(output_path, format='png', view=False, cleanup=True)
+            print(f"Successfully generated PNG diagram: {png_filename}")
+            rendered_file_path = png_filename # Return the PNG path
+
+            # Optionally render SVG as well (maybe controlled by a flag later)
+            # try:
+            #     svg_filename = self.graph.render(output_path, format='svg', view=False, cleanup=True)
+            #     print(f"Successfully generated SVG diagram: {svg_filename}")
+            #     # Decide which path to return, maybe prioritize SVG if successful?
+            #     # rendered_file_path = svg_filename
+            # except Exception as e_svg:
+            #      print(f"Error rendering SVG graph: {e_svg}", file=sys.stderr)
+            #      # Keep the PNG path if SVG fails
+
+        except Exception as e:
+            print(f"\\nError rendering graph with Graphviz: {e}", file=sys.stderr)
+            print("Ensure Graphviz executables (dot) are installed and in your system's PATH.", file=sys.stderr)
+            logging.error(f"Error rendering graph with Graphviz: {e}", exc_info=True)
+            # Attempt to save the DOT source file anyway for manual rendering
+            try:
+                 dot_filename = f"{output_path}.gv"
+                 self.graph.save(filename=dot_filename)
+                 print(f"Saved DOT source file for manual inspection/rendering: {dot_filename}")
+            except Exception as dot_e:
+                 print(f"Error saving DOT source file: {dot_e}", file=sys.stderr)
+                 logging.error(f"Error saving DOT source file: {dot_e}", exc_info=True)
+            rendered_file_path = None # Ensure None is returned on failure
+
+        # 5. Generate the unused objects report (get data and write file)
+        # The function now returns the data, but we still call it to write the file
+        self.generate_unused_report(output_file)
+        
+        # 6. Generate and print the relationship summary (Now handled in app.py)
+        # summary = self.generate_relationship_summary()
+        # print("\\n" + summary) # This line caused the TypeError
+        # Optionally save summary to file (Also handled in app.py or redundant)
+        # summary_file = f"{output_file}_summary.txt"
+        # try:
+        #      with open(summary_file, 'w', encoding='utf-8') as f:
+        #           # Need to format the dict back to string if saving here
+        #           # For now, let app.py handle display
+        #           f.write(str(summary)) # Crude conversion, better formatting needed if uncommented
+        #      print(f"Successfully saved relationship summary to {summary_file}")
+        # except OSError as e:
+        #      print(f"Error writing summary file {summary_file}: {e}", file=sys.stderr)
+        #      logging.error(f"Error writing summary file {summary_file}: {e}")
+             
+        return rendered_file_path # Return the path to the PNG file (or None)
+
+    # --- Utility Functions ---
