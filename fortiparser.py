@@ -31,6 +31,8 @@ class FortiParser:
     END_RE     = re.compile(r'^end$')
     VDOM_CONFIG_RE = re.compile(r'^config\s+vdom$', re.IGNORECASE) # Regex for 'config vdom'
     GLOBAL_CONFIG_RE = re.compile(r'^config\s+global$', re.IGNORECASE) # Regex for 'config global'
+    # Regex for FortiOS version string (handles X.Y and X.Y.Z, various build prefixes)
+    VERSION_RE = re.compile(r'^#config-version=\s*.*?(\d+)\.(\d{1,2})(?:\.(\d+))?.*?\s*(?:-?build|-?b)?\s*(\d+).*$', re.IGNORECASE)
     # --- Section Name Aliases ---
     # Map known historical/alternative section names (normalized) to current handler method names.
     # This helps maintain compatibility across different FortiOS versions.
@@ -59,6 +61,7 @@ class FortiParser:
         self.current_vdom = None # Initialize current VDOM tracking
         self.model = ConfigModel() # Instantiate the model from config_model.py
         self.model.has_vdoms = False # Initialize VDOM flag
+        self.fortios_version_found = False # Track if version line was found
 
     # --- Helper to convert Mask to Prefix ---
     def _mask_to_prefix(self, mask_str):
@@ -72,10 +75,11 @@ class FortiParser:
             elif isinstance(mask_addr, ipaddress.IPv6Address):
                  # IPv6 uses ipaddress internal property
                  # Create a dummy network to extract prefix from mask
-                 dummy_net = ipaddress.IPv6Network(f"::/{mask_str}", strict=False) 
+                 dummy_net = ipaddress.IPv6Network(f"::/%s" % mask_str, strict=False) # Use % formatting for older compatibility if needed
                  return dummy_net.prefixlen
         except ValueError:
-             print(f"Warning: Could not parse mask '{mask_str}' to determine prefix length.", file=sys.stderr)
+             # Provide more specific error message
+             print(f"Warning [Line ~{self.i+1}]: Invalid netmask format '{mask_str}'. Cannot convert to prefix length.", file=sys.stderr)
         return None # Indicate failure
 
     def parse(self):
@@ -83,7 +87,40 @@ class FortiParser:
         self.i = 0
         self.current_vdom = None # Ensure it starts as None
         self.model.has_vdoms = False # Ensure it starts as False
+        self.fortios_version_found = False # Reset for parsing
 
+        # --- First pass: Find FortiOS version ---
+        # Limit search to the first few lines for efficiency
+        version_search_limit = min(20, len(self.lines)) 
+        for line_idx in range(version_search_limit):
+             line = self.lines[line_idx].strip()
+             m_ver = self.VERSION_RE.match(line)
+             if m_ver:
+                 major_str, minor_str, patch_str, build_str = m_ver.groups()
+                 major = int(major_str)
+                 minor = int(minor_str)
+                 # Handle optional patch, defaulting to 0 if missing
+                 patch = int(patch_str) if patch_str is not None else 0
+                 build = int(build_str)
+
+                 # Format version string consistently, including the patch number
+                 version_str = f"v{major}.{minor}.{patch},build{build}"
+
+                 self.model.fortios_version = version_str
+                 self.model.fortios_version_details = {
+                      'major': major,
+                      'minor': minor,
+                      'patch': patch,
+                      'build': build
+                 }
+                 self.fortios_version_found = True
+                 print(f"Detected FortiOS Version: {version_str}") # Log detection
+                 break # Stop searching once found
+                 
+        if not self.fortios_version_found:
+             print("Warning: Could not detect FortiOS version from config header.", file=sys.stderr)
+
+        # --- Main Parsing Loop ---
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
             
@@ -130,6 +167,7 @@ class FortiParser:
             # If not a section start or handled line, just advance
             self.i += 1
 
+        print(f"Detected FortiOS Version: {self.model.fortios_version}")
         return self.model
 
     # --- VDOM Handling Method --- 
@@ -291,17 +329,24 @@ class FortiParser:
                     if current_val:
                         split_vals.append(current_val)
                     
-                    # --- FIX: Handle 'set ip|subnet <ip> <mask>' & Convert to CIDR ---    
+                    # --- FIX: Handle 'set ip|subnet <ip> <mask>' & Convert to CIDR ---
                     if key in ['ip', 'subnet'] and len(split_vals) == 2:
                         ip_part = split_vals[0]
                         mask_part = split_vals[1]
-                        prefix = self._mask_to_prefix(mask_part)
-                        if prefix is not None:
-                             current_item[key] = f"{ip_part}/{prefix}" # Store as ip/prefix string
-                        else:
-                             # Store as ip/mask if prefix conversion failed
-                             current_item[key] = f"{ip_part}/{mask_part}"
-                             print(f"Warning: Storing '{key}' as ip/mask for item '{current_item.get('name', current_item.get('id', '?'))}' due to mask parse failure.", file=sys.stderr)
+                        try:
+                            prefix = self._mask_to_prefix(mask_part)
+                            if prefix is not None:
+                                 # Validate the IP part as well
+                                 ipaddress.ip_address(ip_part)
+                                 current_item[key] = f"{ip_part}/{prefix}" # Store as ip/prefix string
+                            else:
+                                 # Store as ip/mask if prefix conversion failed
+                                 current_item[key] = f"{ip_part}/{mask_part}"
+                                 # Warning printed in _mask_to_prefix
+                        except ValueError:
+                            # Handle invalid IP address format
+                            print(f"Warning [Line {self.i+1}]: Invalid IP address format '{ip_part}' for key '{key}' in item '{current_item.get('name', current_item.get('id', '?'))}'. Storing as '{ip_part}/{mask_part}'.", file=sys.stderr)
+                            current_item[key] = f"{ip_part}/{mask_part}"
                     elif len(split_vals) > 1:
                         current_item[key] = split_vals # Store other multi-word values as list
                     else:
@@ -395,17 +440,24 @@ class FortiParser:
                     if current_val:
                         split_vals.append(current_val)
                         
-                    # --- FIX: Handle 'set ip|subnet <ip> <mask>' & Convert to CIDR ---    
+                    # --- FIX: Handle 'set ip|subnet <ip> <mask>' & Convert to CIDR ---
                     if key in ['ip', 'subnet'] and len(split_vals) == 2:
                         ip_part = split_vals[0]
                         mask_part = split_vals[1]
-                        prefix = self._mask_to_prefix(mask_part)
-                        if prefix is not None:
-                             settings[key] = f"{ip_part}/{prefix}" # Store as ip/prefix string
-                        else:
-                             # Store as ip/mask if prefix conversion failed
+                        try:
+                            prefix = self._mask_to_prefix(mask_part)
+                            if prefix is not None:
+                                 # Validate the IP part as well
+                                 ipaddress.ip_address(ip_part)
+                                 settings[key] = f"{ip_part}/{prefix}" # Store as ip/prefix string
+                            else:
+                                 # Store as ip/mask if prefix conversion failed
+                                 settings[key] = f"{ip_part}/{mask_part}"
+                                 # Warning printed in _mask_to_prefix
+                        except ValueError:
+                             # Handle invalid IP address format
+                             print(f"Warning [Line {self.i+1}]: Invalid IP address format '{ip_part}' for key '{key}' in settings block. Storing as '{ip_part}/{mask_part}'.", file=sys.stderr)
                              settings[key] = f"{ip_part}/{mask_part}"
-                             print(f"Warning: Storing '{key}' as ip/mask in settings block due to mask parse failure.", file=sys.stderr)
                     elif len(split_vals) > 1:
                         settings[key] = split_vals # Store other multi-word values as list
                     else:
@@ -566,6 +618,10 @@ class FortiParser:
                       item['secondary_ip'] = secondary_ips
                  else:
                       item['secondary_ip'] = []
+                 
+                 # --- START ADDITION: Capture description --- 
+                 item['description'] = item.get('description', '') # Store description, default to empty string
+                 # --- END ADDITION ---
                       
                  target_model.interfaces[name] = item
 
@@ -678,23 +734,25 @@ class FortiParser:
 
     def _handle_router_bgp(self):
         target_model = self._get_target_model()
-        settings = self._read_settings()
+        settings = self._read_settings() # Reads the whole block including nested
+        
+        # Extract neighbors if present
+        if 'neighbor' in settings and isinstance(settings['neighbor'], list):
+            target_model.bgp_neighbors = settings.pop('neighbor') 
+        else:
+            target_model.bgp_neighbors = [] # Ensure it's an empty list if not found
+            
+        # Extract networks if present
+        if 'network' in settings and isinstance(settings['network'], list):
+            target_model.bgp_networks = settings.pop('network')
+        else:
+            target_model.bgp_networks = []
+            
+        # Store the remaining top-level BGP settings
         target_model.bgp = settings
 
     # BGP sub-sections handled implicitly by _read_settings recursion
     # def _handle_router_bgp_neighbor(self):
-    #      return self._read_block()
-    # def _handle_router_bgp_network(self):
-    #      return self._read_block()
-    # def _handle_router_bgp_redistribute(self, section_name):
-    #     # Handler for blocks like 'config redistribute connected'
-    #     # Needs to store based on the type (connected, ospf, etc.)
-    #     # The section name 'redistribute connected' needs parsing
-    #     redist_type = section_name.split('_')[-1] # Get 'connected'
-    #     settings = self._read_settings()
-    #     # Return tuple or dict indicating type? _read_settings needs modification
-    #     # For now, assume _read_settings returns dict, store it under type
-    #     return {redist_type: settings} # This structure might need adjustment in _read_settings
 
     def _handle_vpn_ipsec_phase1_interface(self):
         target_model = self._get_target_model()
@@ -837,6 +895,15 @@ class FortiParser:
              vrid = item.get('id') # Keyed by VRID
              if vrid:
                  target_model.vrrp[vrid] = item
+                 
+    # --- Handler for Policy Routes ---
+    def _handle_router_policy(self):
+        target_model = self._get_target_model()
+        items = self._read_block() 
+        # Basic storage, can be refined later if specific fields need processing
+        for item in items:
+             item['id'] = item.get('seq_num', item.get('id')) # Use seq-num if available
+             target_model.policy_routes.append(item)
                  
     # --- Settings Handlers --- 
     # These handle simple settings blocks, often global.
@@ -1066,11 +1133,7 @@ def main():
     except Exception as e:
         print(f"\n!!! Critical parsing error encountered: {e}", file=sys.stderr)
         print("Attempting to proceed, but results may be incomplete.", file=sys.stderr)
-        # Use the partially populated model from the parser instance
-        model = parser.model 
-        # Consider exiting here depending on severity
-        # sys.exit(1)
-        
+
     # --- Initialize Generator --- 
     # Requires the parsed model
     generator = NetworkDiagramGenerator(model)
@@ -1134,7 +1197,6 @@ def main():
                   print("Please ensure 'graphviz' Python library and the Graphviz binaries are installed.", file=sys.stderr)
              except Exception as e:
                   print(f"\n!!! Error during diagram/report generation: {e}", file=sys.stderr)
-                  # Potentially print stack trace here for debugging
         else:
              print("Skipping diagram generation as requested.")
              # Need to run analysis manually if diagram is skipped but we want reports/tree
