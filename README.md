@@ -1,6 +1,6 @@
-# FortiParser Web UI
+# FortiParser
 
-A web-based interface for parsing, visualizing, and auditing FortiGate firewall configurations.
+A web-based interface for parsing, visualising, and auditing FortiGate firewall configurations.
 
 This tool allows you to:
 
@@ -17,12 +17,7 @@ This tool allows you to:
     *   Python 3.8+
     *   Graphviz: You need to install the Graphviz binaries separately for your operating system. Make sure the `dot` executable is in your system's PATH.
 
-2.  **Clone the repository (or download the files):**
-    ```bash
-    git clone <your-repo-url> # Or download and extract the files
-    cd FortiParser # Or your project directory
-    ```
-3.  **Install Python dependencies:**
+2.  **Install Python dependencies:**
     ```bash
     pip install -r requirements.txt
     ```
@@ -38,7 +33,7 @@ This tool allows you to:
     *   Upload your FortiGate configuration file.
     *   (Optional) Set a custom base name for output files (diagrams, reports).
     *   (Optional) Configure and enable Path Tracing.
-4.  Click the "Parse & Analyze Configuration" button.
+4.  Click the "Parse & Analyse Configuration" button.
 5.  Results (Diagram, Audit Findings, Reports, Tables) will be displayed in the main area.
     *   Diagrams and reports are also saved as files in the directory where you ran the command (e.g., `network_topology.png`, `network_topology_unused_report.txt`).
 
