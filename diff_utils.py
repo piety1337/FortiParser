@@ -233,7 +233,7 @@ def format_value(value):
 def format_diff_results(diff_data: dict):
     """Formats the structured diff data into HTML for Streamlit display."""
     html_output = []
-    # Basic CSS for table styling
+    # Basic CSS for table styling - MODIFIED FOR BETTER CONTRAST
     html_output.append("""
     <style>
         .diff-table {
@@ -246,14 +246,30 @@ def format_diff_results(diff_data: dict):
             padding: 8px;
             text-align: left;
             vertical-align: top;
+            color: #333333; /* Default darker text color */
         }
         .diff-table th {
             background-color: #e0e0e0;
         }
-        .diff-table tr.added td { background-color: #f0fff4; } /* Lighter Green */
-        .diff-table tr.deleted td { background-color: #fff0f1; } /* Lighter Red/Pink */
+        /* Ensure text color is dark for added/deleted rows */
+        .diff-table tr.added td {
+            background-color: #e6ffed; /* Slightly adjusted green */
+            color: #222222; /* Ensure dark text */
+        }
+        .diff-table tr.deleted td {
+             background-color: #ffebee; /* Slightly adjusted red/pink */
+             color: #222222; /* Ensure dark text */
+        }
         .diff-table tr.modified td:first-child { font-weight: bold; }
-        .diff-table pre { background-color: #f8f8f8; padding: 5px; border: 1px solid #ddd; white-space: pre-wrap; word-wrap: break-word; }
+        /* Ensure code/pre blocks within diffs also have good contrast */
+        .diff-table pre, .diff-table code {
+             background-color: #f8f8f8;
+             padding: 5px;
+             border: 1px solid #ddd;
+             white-space: pre-wrap;
+             word-wrap: break-word;
+             color: #333333; /* Ensure code text is dark */
+        }
         .change-detail { margin-left: 15px; }
         .field-name { font-weight: bold; }
     </style>
