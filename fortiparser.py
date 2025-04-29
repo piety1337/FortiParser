@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FortiGate Comprehensive Table Report Parser & Diagram Generator
+FortiGate Parser & Diagram Generator
 
 Parses a FortiGate CLI configuration file, generates diagrams, reports,
 and optionally performs path tracing.
@@ -23,12 +23,15 @@ from utils import print_table
 
 class FortiParser:
     """Parses a FortiGate CLI export into a ConfigModel."""
-    SECTION_RE = re.compile(r'^config\s+(.+)$') # Removed extra backslash before \s
-    # Improved regex for 'edit' command: handles quoted/unquoted names and trailing spaces
-    EDIT_RE    = re.compile(r'^edit\s+(?:"([^"]+)"|(\S+))\s*$', re.IGNORECASE)
-    SET_RE     = re.compile(r'^set\s+(\S+)\s+(.+)$')
-    NEXT_RE    = re.compile(r'^next$')
-    END_RE     = re.compile(r'^end$')
+    # More flexible regex: Allow more whitespace, handle names with spaces if quoted.
+    SECTION_RE = re.compile(r'^config\s+("?.*?"?|\S+)\s*$') # Handle quoted/unquoted section names
+    EDIT_RE    = re.compile(r'^\s*edit\s+(?:"([^"]+)"|(\S+))\s*$', re.IGNORECASE) # Allow leading space
+    SET_RE     = re.compile(r'^\s*set\s+(\S+)\s+(.*)$') # Allow leading space, capture everything after name
+    # Append/Unset commands (useful for diffing later, but maybe not primary parse)
+    APPEND_RE  = re.compile(r'^\s*append\s+(\S+)\s+(.*)$')
+    UNSET_RE   = re.compile(r'^\s*unset\s+(\S+)\s*$')
+    NEXT_RE    = re.compile(r'^\s*next\s*$', re.IGNORECASE) # Allow leading/trailing space
+    END_RE     = re.compile(r'^\s*end\s*$', re.IGNORECASE)   # Allow leading/trailing space
     VDOM_CONFIG_RE = re.compile(r'^config\s+vdom$', re.IGNORECASE) # Regex for 'config vdom'
     GLOBAL_CONFIG_RE = re.compile(r'^config\s+global$', re.IGNORECASE) # Regex for 'config global'
     # Regex for FortiOS version string (handles X.Y and X.Y.Z, various build prefixes)
@@ -55,9 +58,11 @@ class FortiParser:
         # Add more aliases here as needed
     }
 
-    def __init__(self, lines):
+    # ADDED debug flag
+    def __init__(self, lines, debug=False):
         self.lines = lines
         self.i     = 0
+        self.debug = debug # Store debug flag
         self.current_vdom = None # Initialize current VDOM tracking
         self.model = ConfigModel() # Instantiate the model from config_model.py
         self.model.has_vdoms = False # Initialize VDOM flag
@@ -88,10 +93,11 @@ class FortiParser:
         self.current_vdom = None # Ensure it starts as None
         self.model.has_vdoms = False # Ensure it starts as False
         self.fortios_version_found = False # Reset for parsing
+        last_successful_line = 0 # Track the last line successfully processed
+        if self.debug: print("*** FortiParser START ***") # DEBUG
 
         # --- First pass: Find FortiOS version ---
-        # Limit search to the first few lines for efficiency
-        version_search_limit = min(20, len(self.lines)) 
+        version_search_limit = min(20, len(self.lines))
         for line_idx in range(version_search_limit):
              line = self.lines[line_idx].strip()
              m_ver = self.VERSION_RE.match(line)
@@ -99,75 +105,129 @@ class FortiParser:
                  major_str, minor_str, patch_str, build_str = m_ver.groups()
                  major = int(major_str)
                  minor = int(minor_str)
-                 # Handle optional patch, defaulting to 0 if missing
                  patch = int(patch_str) if patch_str is not None else 0
                  build = int(build_str)
-
-                 # Format version string consistently, including the patch number
                  version_str = f"v{major}.{minor}.{patch},build{build}"
-
                  self.model.fortios_version = version_str
                  self.model.fortios_version_details = {
-                      'major': major,
-                      'minor': minor,
-                      'patch': patch,
-                      'build': build
+                      'major': major, 'minor': minor, 'patch': patch, 'build': build
                  }
                  self.fortios_version_found = True
-                 print(f"Detected FortiOS Version: {version_str}") # Log detection
-                 break # Stop searching once found
-                 
+                 print(f"Detected FortiOS Version: {version_str}")
+                 break
+
         if not self.fortios_version_found:
              print("Warning: Could not detect FortiOS version from config header.", file=sys.stderr)
 
         # --- Main Parsing Loop ---
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
-            
+            original_line_index = self.i # Store index before potential skips
+
             # Skip empty lines and comments
             if not line or line.startswith('#'):
                 self.i += 1
-                continue
-                
-            # --- VDOM Handling --- 
-            if self.VDOM_CONFIG_RE.match(line):
-                self._handle_vdom_config() 
-                self.current_vdom = None 
-                continue
-                
-            # --- Global Context Handling ---
-            if self.GLOBAL_CONFIG_RE.match(line):
-                self.current_vdom = 'global' if self.model.has_vdoms else None 
-                self.i += 1 # Consume 'config global'
+                last_successful_line = self.i # Update even on skips
+                if self.debug: print(f"[L{self.i}] Skipping comment/empty") # DEBUG
                 continue
 
-            # --- Regular Section Parsing (Applies to Root, Global, or after VDOM block) --- 
-            m = self.SECTION_RE.match(line)
-            if m:
-                raw_section_name = m.group(1).strip()
+            # --- Top-Level Commands --- #
+            m_vdom = self.VDOM_CONFIG_RE.match(line)
+            m_global = self.GLOBAL_CONFIG_RE.match(line)
+            m_section = self.SECTION_RE.match(line)
+            m_end = self.END_RE.match(line) # Check for stray 'end' at top level
+
+            if m_vdom:
+                if self.debug: print(f"[L{original_line_index+1}] Entering VDOM config") # DEBUG
+                self._handle_vdom_config()
+                self.current_vdom = None # Reset VDOM context after the block
+                last_successful_line = self.i
+                if self.debug: print(f"[L{self.i}] Exiting VDOM config") # DEBUG
+                continue
+
+            elif m_global:
+                if self.debug: print(f"[L{original_line_index+1}] Entering Global config") # DEBUG
+                self.current_vdom = 'global' if self.model.has_vdoms else None
+                self.i += 1 # Consume 'config global'
+                # TODO: Optionally handle settings directly under 'config global' if they exist
+                # Need to check if 'config global' contains only 'config' blocks or also 'set' commands
+                last_successful_line = self.i
+                if self.debug: print(f"[L{self.i}] Exiting Global config") # DEBUG
+                continue
+
+            elif m_section:
+                # --- Regular Section Parsing --- #
+                # Group 1 contains the potentially quoted section name
+                raw_section_name = m_section.group(1).strip().replace('"', '') # Remove quotes
                 normalized_section_name = raw_section_name.lower().replace(' ', '_').replace('-', '_')
-                
+
                 handler_method_name = self.SECTION_ALIASES.get(normalized_section_name)
-                
                 if not handler_method_name:
                     handler_method_name = f'_handle_{normalized_section_name}'
-                
+
                 handler = getattr(self, handler_method_name, None)
+                if self.debug: print(f"[L{original_line_index+1}] Matched section: '{raw_section_name}' -> Handler: {handler_method_name if handler else 'Generic/None'}") # DEBUG
 
                 if handler:
                     try:
-                        handler()
+                        handler() # Call the specific or generic handler
+                        # Handler should advance self.i past the section's end
+                        last_successful_line = self.i
                     except Exception as e:
-                        print(f"ERROR: Handler {handler_method_name} failed for section '{raw_section_name}' at line {self.i+1}: {e}", file=sys.stderr)
-                        self._skip_block()
+                        print(f"ERROR: Handler {handler_method_name} failed processing section '{raw_section_name}' starting near line {original_line_index + 1}: {e}", file=sys.stderr)
+                        print(f"Attempting to recover by skipping to next likely block start or end...", file=sys.stderr)
+                        # --- Recovery Attempt --- #
+                        self.i = original_line_index # Reset i to start of failed section
+                        if not self._skip_to_next_block_or_end():
+                             print(f"FATAL: Recovery failed. Could not find next block after error at line {original_line_index + 1}. Stopping parse.", file=sys.stderr)
+                             return self.model # Return partially parsed model
+                        print(f"Recovered: Skipped to line {self.i + 1}.", file=sys.stderr)
                 else:
-                    self._handle_generic_section(raw_section_name, normalized_section_name)
-                continue
-            
-            # If not a section start or handled line, just advance
-            self.i += 1
+                    # No specific handler found, use generic (which also calls _read_block/_read_settings)
+                    if self.debug: print(f"[L{original_line_index+1}] Using generic handler for section '{raw_section_name}'", file=sys.stderr) # DEBUG
+                    try:
+                        self._handle_generic_section(raw_section_name, normalized_section_name)
+                        last_successful_line = self.i
+                    except Exception as e:
+                         print(f"ERROR: Generic handler failed processing section '{raw_section_name}' starting near line {original_line_index + 1}: {e}", file=sys.stderr)
+                         print(f"Attempting to recover by skipping to next likely block start or end...", file=sys.stderr)
+                         self.i = original_line_index
+                         if not self._skip_to_next_block_or_end():
+                              print(f"FATAL: Recovery failed. Could not find next block after error at line {original_line_index + 1}. Stopping parse.", file=sys.stderr)
+                              return self.model
+                         print(f"Recovered: Skipped to line {self.i + 1}.", file=sys.stderr)
+                continue # Continue main loop after handling section
 
-        print(f"Detected FortiOS Version: {self.model.fortios_version}")
+            elif m_end:
+                # Encountered an 'end' at the top level or VDOM level inappropriately
+                print(f"Warning [Line {original_line_index + 1}]: Encountered unexpected 'end' statement outside of a config block. Skipping.", file=sys.stderr)
+                self.i += 1
+                last_successful_line = self.i
+                continue
+
+            # --- Handle unexpected lines --- #
+            else:
+                # This line doesn't match any known top-level command or pattern
+                print(f"Warning [Line {original_line_index + 1}]: Skipping unexpected line at top level: {line}", file=sys.stderr)
+                # Simple recovery: just advance. More robust recovery could search forward.
+                self.i += 1
+                # Don't update last_successful_line here, as this line wasn't processed
+
+        # --- End of Parsing --- #
+        if self.i < len(self.lines):
+             print(f"Warning: Parsing loop finished prematurely at line {self.i + 1}. Check for errors or unexpected EOF.", file=sys.stderr)
+        elif self.i > last_successful_line:
+             print(f"Warning: Parsing finished, but the last {self.i - last_successful_line} lines might not have been fully processed due to trailing unexpected content or errors.", file=sys.stderr)
+        else:
+             print(f"Parsing complete. Processed {last_successful_line} lines.")
+
+        # Print detected version at the end as well
+        if self.model.fortios_version:
+            print(f"Detected FortiOS Version: {self.model.fortios_version}")
+        else:
+             print(f"Final Check: FortiOS Version not detected.")
+             
+        if self.debug: print("*** FortiParser END ***") # DEBUG
         return self.model
 
     # --- VDOM Handling Method --- 
@@ -239,36 +299,110 @@ class FortiParser:
         
     # --- Block Reading Helpers --- 
     def _skip_block(self):
-        """Skip lines until the matching 'end' is found."""
+        """(Deprecated - Use _skip_to_next_block_or_end) Skip lines until the matching 'end' is found. Basic version."""
+        print("DEPRECATION WARNING: _skip_block() called. Use _skip_to_next_block_or_end() for better recovery.", file=sys.stderr)
         nesting_level = 1
-        self.i += 1
+        # self.i should be at the line *after* the failed 'config' line when this is called by old logic
+        start_line = self.i
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
-            if line.startswith('config '):
+            # Use SECTION_RE to correctly identify nested config starts
+            if self.SECTION_RE.match(line):
                 nesting_level += 1
             elif self.END_RE.match(line):
                 nesting_level -= 1
                 if nesting_level == 0:
-                    self.i += 1
-                    return
+                    self.i += 1 # Consume the final 'end'
+                    print(f"_skip_block: Skipped from {start_line +1} to {self.i + 1}", file=sys.stderr)
+                    return True # Successfully skipped the block
             self.i += 1
-        print("Warning: Reached end of file while skipping block.", file=sys.stderr)
+        print(f"Warning: Reached end of file while skipping block starting near line {start_line + 1}. Nesting level: {nesting_level}", file=sys.stderr)
+        return False # Failed to find matching end
+
+    def _skip_to_next_block_or_end(self):
+        """Robustly skips the current block or malformed lines until the next 'config' or top-level 'end'.
+        
+        Assumes self.i is at the start of the problematic line/block.
+        Advances self.i to the beginning of the next valid block or EOF.
+        Returns True if recovery seems successful, False otherwise.
+        """
+        original_line_index = self.i
+        nesting_level = 1 # Assume we are inside the block that failed to parse
+        print(f"_skip_to_next_block_or_end: Starting recovery from line {original_line_index + 1}...", file=sys.stderr)
+        
+        self.i += 1 # Start searching from the next line
+        while self.i < len(self.lines):
+            line = self.lines[self.i].strip()
+
+            # Skip comments and empty lines during search
+            if not line or line.startswith('#'):
+                self.i += 1
+                continue
+
+            # Check for nested config start
+            if self.SECTION_RE.match(line):
+                 nesting_level += 1
+                 print(f"_skip: Nested config found at line {self.i+1}, level -> {nesting_level}", file=sys.stderr) # DEBUG
+            # Check for end command
+            elif self.END_RE.match(line):
+                 nesting_level -= 1
+                 print(f"_skip: End found at line {self.i+1}, level -> {nesting_level}", file=sys.stderr) # DEBUG
+                 if nesting_level == 0:
+                     # Found the end of the block we were trying to skip
+                     self.i += 1 # Consume the 'end'
+                     print(f"_skip_to_next_block_or_end: Found matching 'end' at line {self.i}. Resuming parse.", file=sys.stderr)
+                     return True
+                 elif nesting_level < 0:
+                      # Too many ends - indicates a malformed structure earlier
+                      print(f"Warning [Line {self.i+1}]: Encountered unexpected 'end' during skip recovery (nesting level {nesting_level}). Possible config corruption.", file=sys.stderr)
+                      # Treat this as potentially the end of the faulty block anyway?
+                      self.i += 1
+                      return True # Attempt to continue
+
+            # If nesting level is back to 0 (or less), look for the *next* config block start
+            if nesting_level <= 0:
+                 if self.SECTION_RE.match(line) or self.VDOM_CONFIG_RE.match(line) or self.GLOBAL_CONFIG_RE.match(line):
+                     print(f"_skip_to_next_block_or_end: Found next config block at line {self.i + 1}. Resuming parse before this line.", file=sys.stderr)
+                     # Do *not* consume this line, the main loop should handle it
+                     return True
+
+            # Keep searching
+            self.i += 1
+
+        # Reached EOF
+        print(f"Warning: Reached end of file during skip recovery starting from line {original_line_index + 1}. Final nesting level: {nesting_level}", file=sys.stderr)
+        return False # Indicate recovery might not position parser correctly
 
     def _read_block(self):
         """Read a block of settings for a list-based config section (e.g., firewall policy)."""
         items = []
-        self.i += 1
+        block_start_line = self.i # For debug
+        # We assume the 'config <section>' line was already consumed by the caller
+        # self.i += 1 - NO LONGER NEEDED HERE
         current_item = None
         nesting_level = 1
-        
+        if self.debug: print(f" >> Enter _read_block @ L{block_start_line+1}, Level {nesting_level}") # DEBUG
+
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
+            if self.debug: print(f"    [L{self.i+1}, Lvl {nesting_level}] Read: {line}") # DEBUG
             current_item_id = current_item.get('id', current_item.get('name', 'None')) if current_item else 'None'
 
+            # Handle nested config blocks first
             if line.startswith('config '):
                  nesting_level += 1
-                 nested_section_name = line.split(None, 1)[1].strip()
+                 # Extract nested section name (handle potential quotes)
+                 match_nested_section = self.SECTION_RE.match(line)
+                 if match_nested_section:
+                     nested_section_name = match_nested_section.group(1).strip().replace('"', '') # Remove quotes if present
+                 else:
+                     # Fallback or log warning if SECTION_RE fails (shouldn't happen often)
+                     print(f"Warning [Line {self.i+1}]: Could not properly extract nested section name from: {line}", file=sys.stderr)
+                     nested_section_name = line.split(None, 1)[1].strip()
+
                  nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+
+                 # Determine if nested block is list or settings
                  peek_i = self.i + 1
                  is_list_block = False
                  while peek_i < len(self.lines):
@@ -278,118 +412,195 @@ class FortiParser:
                          continue
                      if self.EDIT_RE.match(peek_line):
                          is_list_block = True
-                     break
-                     
+                     break # Found first significant line
+
+                 # Recursively read the nested block
                  if is_list_block:
                      nested_data = self._read_block()
                  else:
                      nested_data = self._read_settings()
-                 
-                 nesting_level -= 1
+
+                 nesting_level -= 1 # Decrement after the recursive call returns
 
                  if current_item is not None:
+                     # Store nested data under the normalized key
+                     # Handle potential conflicts if key exists? Overwrite for now.
                      current_item[nested_key] = nested_data
                  else:
-                      pass
-                 if self.i < len(self.lines):
-                      pass
-                 else:
-                      break
-                 continue
+                     # This case (nested config outside an 'edit' item) might be unusual
+                     # Store it at the list level? Needs investigation based on FortiOS structure.
+                     print(f"Warning [Line {self.i+1}]: Nested config block '{nested_section_name}' found outside an 'edit' item. Storing may be ambiguous.", file=sys.stderr)
+                     # Perhaps store with a special key in the last item? Or create a dummy item?
+                     # Safest for now is to potentially lose it if not inside an item.
 
+                 # Check if recursive call consumed the 'end' line appropriately
+                 # The recursive call should place self.i *after* the 'end' it consumed.
+                 # No need to increment self.i here, the recursive call did it.
+                 continue # Continue to the next line after the nested block
+
+            # --- Match Standard Commands ---
             m_edit = self.EDIT_RE.match(line)
             m_set = self.SET_RE.match(line)
+            m_append = self.APPEND_RE.match(line) # ADDED APPEND
+            m_unset = self.UNSET_RE.match(line)   # ADDED UNSET
             m_next = self.NEXT_RE.match(line)
             m_end = self.END_RE.match(line)
-            
+
             if m_edit:
                 if current_item is not None:
-                    items.append(current_item)
-                edit_val = m_edit.group(1) or m_edit.group(2)
+                    items.append(current_item) # Save previous item
+                edit_val = m_edit.group(1) or m_edit.group(2) # Quoted or unquoted name
+                # Determine if the edit value is likely an integer ID or a string name
                 id_key = 'id' if edit_val.isdigit() else 'name'
                 current_item = {id_key: edit_val}
             elif m_set and current_item is not None:
-                key = m_set.group(1).replace('-', '_')
-                val = m_set.group(2).strip()
-                if val.startswith('"') and val.endswith('"'):
-                    val = val[1:-1]
-                if ' ' in val and not (val.startswith('"') and val.endswith('"')):
+                key = m_set.group(1).replace('-', '_') # Normalize key
+                raw_val = m_set.group(2).strip()     # Get the raw value part
+
+                # --- Robust Value Parsing ---
+                # 1. Handle explicitly quoted single values
+                if raw_val.startswith('"') and raw_val.endswith('"'):
+                    val = raw_val[1:-1]
+                # 2. Handle multi-word values, potentially with quotes inside
+                elif ' ' in raw_val:
+                    # Try splitting respecting quotes
                     split_vals = []
                     current_val = ''
                     in_quotes = False
-                    for char in val:
-                        if char == '"' :
+                    for char in raw_val:
+                        if char == '"':
                             in_quotes = not in_quotes
                         elif char == ' ' and not in_quotes:
-                            if current_val:
+                            if current_val: # Append if non-empty
                                 split_vals.append(current_val)
                             current_val = ''
                         else:
                             current_val += char
-                    if current_val:
+                    if current_val: # Append the last part
                         split_vals.append(current_val)
-                    
-                    # --- FIX: Handle 'set ip|subnet <ip> <mask>' & Convert to CIDR ---
+
+                    # Special case: 'set ip <ip> <mask>' or 'set subnet <ip> <mask>'
                     if key in ['ip', 'subnet'] and len(split_vals) == 2:
                         ip_part = split_vals[0]
                         mask_part = split_vals[1]
                         try:
                             prefix = self._mask_to_prefix(mask_part)
                             if prefix is not None:
-                                 # Validate the IP part as well
-                                 ipaddress.ip_address(ip_part)
-                                 current_item[key] = f"{ip_part}/{prefix}" # Store as ip/prefix string
+                                # Validate the IP part as well
+                                ipaddress.ip_address(ip_part)
+                                val = f"{ip_part}/{prefix}" # Store as ip/prefix string
                             else:
-                                 # Store as ip/mask if prefix conversion failed
-                                 current_item[key] = f"{ip_part}/{mask_part}"
-                                 # Warning printed in _mask_to_prefix
+                                val = f"{ip_part}/{mask_part}" # Store as ip/mask if conversion failed
+                                # Warning printed in _mask_to_prefix
                         except ValueError:
-                            # Handle invalid IP address format
-                            print(f"Warning [Line {self.i+1}]: Invalid IP address format '{ip_part}' for key '{key}' in item '{current_item.get('name', current_item.get('id', '?'))}'. Storing as '{ip_part}/{mask_part}'.", file=sys.stderr)
-                            current_item[key] = f"{ip_part}/{mask_part}"
+                            print(f"Warning [Line {self.i+1}]: Invalid IP/mask format '{ip_part} {mask_part}' for key '{key}'. Storing as is.", file=sys.stderr)
+                            val = f"{ip_part}/{mask_part}" # Store the potentially problematic value
+                    # If multiple values remain after splitting, store as list
                     elif len(split_vals) > 1:
-                        current_item[key] = split_vals # Store other multi-word values as list
+                         # Check if it looks like multiple simple values (e.g., set member a b c)
+                         # or a single value that happened to contain spaces but wasn't fully quoted
+                         # Heuristic: If no internal quotes were detected, treat as list.
+                         # If internal quotes were involved, maybe treat as single string? Needs refinement.
+                         # For now, assume space separation means list if not fully quoted start/end.
+                        val = split_vals
+                    # Otherwise, treat as single value (might have spaces if improperly quoted)
                     else:
-                        current_item[key] = split_vals[0] if split_vals else '' 
-                    # --- FIX END ---
+                        val = raw_val # Store the raw value if splitting logic didn't produce multiple items
+                # 3. Handle simple single values
                 else:
-                    current_item[key] = val
+                    val = raw_val
+
+                # Store the processed value
+                current_item[key] = val
+                if self.debug: print(f"       -> Stored set: {key} = {val}") # DEBUG
+
+            # --- Handle append/unset (Store differently for potential diffing?) ---
+            elif m_append and current_item is not None:
+                 key = m_append.group(1).replace('-', '_')
+                 raw_val = m_append.group(2).strip()
+                 # Parse value similar to 'set'
+                 if raw_val.startswith('"') and raw_val.endswith('"'):
+                     append_val = raw_val[1:-1]
+                 else:
+                     # Simplified: treat appended value as single string for now
+                     # TODO: Enhance parsing if lists can be appended piece by piece
+                     append_val = raw_val
+
+                 # Store append operations - maybe in a separate structure or flag?
+                 # Simple approach: Ensure key exists as a list and append
+                 if key not in current_item:
+                     current_item[key] = []
+                 elif not isinstance(current_item[key], list):
+                     # Promote existing single value to list
+                     current_item[key] = [current_item[key]]
+                 current_item[key].append(append_val)
+                 if self.debug: print(f"       -> Handled append for key '{key}', value '{append_val}'") # DEBUG
+
+            elif m_unset and current_item is not None:
+                 key = m_unset.group(1).replace('-', '_')
+                 # Mark the key as unset? Or remove it? Removing is simpler for final state.
+                 if key in current_item:
+                     del current_item[key]
+                 # TODO: Store unset operations if needed for diffing
+                 if self.debug: print(f"       -> Handled unset for key '{key}'") # DEBUG
+
             elif m_next:
                  if current_item is not None:
                      items.append(current_item)
-                 current_item = None
+                 current_item = None # Reset for the next item
             elif m_end:
                  nesting_level -= 1
                  if nesting_level == 0:
                      if current_item is not None:
-                         items.append(current_item)
-                     self.i += 1
-                     return items
+                         items.append(current_item) # Append the last item
+                     self.i += 1 # Consume 'end'
+                     if self.debug: print(f" << Exit _read_block (found end) @ L{self.i}, Final Level {nesting_level}") # DEBUG
+                     return items # Return list of parsed items
                  else:
+                     # This 'end' closes a nested block handled earlier. Just continue.
                      pass
             elif not line or line.startswith('#'):
-                 pass
+                 pass # Skip comments and empty lines
+            # --- ADDED: Handle unexpected lines ---
+            else:
+                 print(f"Warning [Line {self.i+1}]: Skipping unexpected line inside block for item '{current_item_id}': {line}", file=sys.stderr)
 
-            self.i += 1
-            
-        print(f"Warning: Reached end of file while reading block.", file=sys.stderr)
+            self.i += 1 # Move to the next line
+
+        # End of loop (likely reached EOF)
+        print(f"Warning: Reached end of file while reading block (nesting level {nesting_level}).", file=sys.stderr)
         if current_item is not None:
-            items.append(current_item)
+            items.append(current_item) # Append the last item if loop terminated abruptly
+        if self.debug: print(f" << Exit _read_block (EOF) @ L{self.i}, Final Level {nesting_level}") # DEBUG
         return items
 
     def _read_settings(self):
         """Read a block of settings for a single-item config section (e.g., system dns)."""
         settings = {}
-        self.i += 1
+        block_start_line = self.i # For debug
+        # We assume the 'config <section>' line was already consumed by the caller
+        # self.i += 1 - NO LONGER NEEDED HERE
         nesting_level = 1
-        
+        if self.debug: print(f" >> Enter _read_settings @ L{block_start_line+1}, Level {nesting_level}") # DEBUG
+
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
-            
+            if self.debug: print(f"    [L{self.i+1}, Lvl {nesting_level}] Read: {line}") # DEBUG
+
+            # Handle nested config blocks first
             if line.startswith('config '):
                  nesting_level += 1
-                 nested_section_name = line.split(None, 1)[1].strip()
+                 # Extract nested section name (handle potential quotes)
+                 match_nested_section = self.SECTION_RE.match(line)
+                 if match_nested_section:
+                     nested_section_name = match_nested_section.group(1).strip().replace('"', '')
+                 else:
+                     print(f"Warning [Line {self.i+1}]: Could not properly extract nested section name from: {line}", file=sys.stderr)
+                     nested_section_name = line.split(None, 1)[1].strip()
+
                  nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+
+                 # Determine if nested block is list or settings
                  peek_i = self.i + 1
                  is_list_block = False
                  while peek_i < len(self.lines):
@@ -400,36 +611,40 @@ class FortiParser:
                      if self.EDIT_RE.match(peek_line):
                          is_list_block = True
                      break
-                 
+
+                 # Recursively read the nested block
                  if is_list_block:
                       nested_data = self._read_block()
                  else:
                       nested_data = self._read_settings()
-                 
-                 nesting_level -= 1
 
+                 nesting_level -= 1 # Decrement after the recursive call returns
+
+                 # Store nested data under the normalized key
                  settings[nested_key] = nested_data
 
-                 if self.i < len(self.lines):
-                      pass
-                 else:
-                      break
+                 # Continue to the next line after the nested block
                  continue
 
+            # --- Match Standard Commands ---
             m_set = self.SET_RE.match(line)
+            m_append = self.APPEND_RE.match(line) # ADDED APPEND
+            m_unset = self.UNSET_RE.match(line)   # ADDED UNSET
             m_end = self.END_RE.match(line)
-            
+
             if m_set:
-                key = m_set.group(1).replace('-', '_')
-                val = m_set.group(2).strip()
-                if val.startswith('"') and val.endswith('"'):
-                    val = val[1:-1]
-                if ' ' in val and not (val.startswith('"') and val.endswith('"')):
+                key = m_set.group(1).replace('-', '_') # Normalize key
+                raw_val = m_set.group(2).strip()     # Get the raw value part
+
+                # --- Robust Value Parsing (same logic as _read_block) ---
+                if raw_val.startswith('"') and raw_val.endswith('"'):
+                    val = raw_val[1:-1]
+                elif ' ' in raw_val:
                     split_vals = []
                     current_val = ''
                     in_quotes = False
-                    for char in val:
-                        if char == '"' :
+                    for char in raw_val:
+                        if char == '"':
                             in_quotes = not in_quotes
                         elif char == ' ' and not in_quotes:
                             if current_val:
@@ -439,45 +654,71 @@ class FortiParser:
                             current_val += char
                     if current_val:
                         split_vals.append(current_val)
-                        
-                    # --- FIX: Handle 'set ip|subnet <ip> <mask>' & Convert to CIDR ---
+
                     if key in ['ip', 'subnet'] and len(split_vals) == 2:
                         ip_part = split_vals[0]
                         mask_part = split_vals[1]
                         try:
                             prefix = self._mask_to_prefix(mask_part)
                             if prefix is not None:
-                                 # Validate the IP part as well
-                                 ipaddress.ip_address(ip_part)
-                                 settings[key] = f"{ip_part}/{prefix}" # Store as ip/prefix string
+                                ipaddress.ip_address(ip_part)
+                                val = f"{ip_part}/{prefix}"
                             else:
-                                 # Store as ip/mask if prefix conversion failed
-                                 settings[key] = f"{ip_part}/{mask_part}"
-                                 # Warning printed in _mask_to_prefix
+                                val = f"{ip_part}/{mask_part}"
                         except ValueError:
-                             # Handle invalid IP address format
-                             print(f"Warning [Line {self.i+1}]: Invalid IP address format '{ip_part}' for key '{key}' in settings block. Storing as '{ip_part}/{mask_part}'.", file=sys.stderr)
-                             settings[key] = f"{ip_part}/{mask_part}"
+                            print(f"Warning [Line {self.i+1}]: Invalid IP/mask format '{ip_part} {mask_part}' for key '{key}'. Storing as is.", file=sys.stderr)
+                            val = f"{ip_part}/{mask_part}"
                     elif len(split_vals) > 1:
-                        settings[key] = split_vals # Store other multi-word values as list
+                        val = split_vals
                     else:
-                        settings[key] = split_vals[0] if split_vals else '' 
-                    # --- FIX END ---
+                        val = raw_val
                 else:
-                     settings[key] = val
+                    val = raw_val
+
+                settings[key] = val
+                if self.debug: print(f"       -> Stored set: {key} = {val}") # DEBUG
+
+            elif m_append:
+                 key = m_append.group(1).replace('-', '_')
+                 raw_val = m_append.group(2).strip()
+                 if raw_val.startswith('"') and raw_val.endswith('"'):
+                     append_val = raw_val[1:-1]
+                 else:
+                     append_val = raw_val
+
+                 if key not in settings:
+                     settings[key] = []
+                 elif not isinstance(settings[key], list):
+                     settings[key] = [settings[key]]
+                 settings[key].append(append_val)
+                 if self.debug: print(f"       -> Handled append for key '{key}', value '{append_val}'") # DEBUG
+
+            elif m_unset:
+                 key = m_unset.group(1).replace('-', '_')
+                 if key in settings:
+                     del settings[key]
+                 if self.debug: print(f"       -> Handled unset for key '{key}'") # DEBUG
+
             elif m_end:
                  nesting_level -= 1
                  if nesting_level == 0:
-                     self.i += 1
-                     return settings
+                     self.i += 1 # Consume 'end'
+                     if self.debug: print(f" << Exit _read_settings (found end) @ L{self.i}, Final Level {nesting_level}") # DEBUG
+                     return settings # Return the dictionary of settings
                  else:
+                     # This 'end' closes a nested block.
                      pass
             elif not line or line.startswith('#'):
-                 pass
+                 pass # Skip comments and empty lines
+            # --- ADDED: Handle unexpected lines ---
+            else:
+                 print(f"Warning [Line {self.i+1}]: Skipping unexpected line inside settings block: {line}", file=sys.stderr)
 
-            self.i += 1
-            
-        print("Warning: Reached end of file while reading settings.", file=sys.stderr)
+            self.i += 1 # Move to the next line
+
+        # End of loop (likely reached EOF)
+        print(f"Warning: Reached end of file while reading settings (nesting level {nesting_level}).", file=sys.stderr)
+        if self.debug: print(f" << Exit _read_settings (EOF) @ L{self.i}, Final Level {nesting_level}") # DEBUG
         return settings
 
     # --- Specific Section Handlers --- 
@@ -1111,6 +1352,8 @@ def main():
     # Output format arguments (optional)
     p.add_argument('--no-diagram', action='store_true', help="Skip diagram generation")
     p.add_argument('--no-tables', action='store_true', help="Skip printing ASCII tables to console")
+    # ADDED Debug argument
+    p.add_argument('--debug', action='store_true', help="Enable verbose debug output during parsing")
 
     args = p.parse_args()
 
@@ -1126,10 +1369,11 @@ def main():
          sys.exit(1)
 
     print(f"Parsing configuration file: {args.config_file}...")
-    parser = FortiParser(config_lines)
+    # Pass debug flag to parser
+    parser = FortiParser(config_lines, debug=args.debug)
     try:
         model = parser.parse()
-        print("Parsing complete.")
+        # Removed redundant print("Parsing complete.") here, moved inside parse()
     except Exception as e:
         print(f"\n!!! Critical parsing error encountered: {e}", file=sys.stderr)
         print("Attempting to proceed, but results may be incomplete.", file=sys.stderr)
