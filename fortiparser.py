@@ -3,7 +3,7 @@
 """
 FortiGate Parser & Diagram Generator
 
-Parses a FortiGate CLI configuration file, generates diagrams, reports,
+Parses a FortiGate configuration file, generates diagrams, reports,
 and optionally performs path tracing.
 """
 
@@ -139,6 +139,8 @@ class FortiParser:
 
             if m_vdom:
                 if self.debug: print(f"[L{original_line_index+1}] Entering VDOM config") # DEBUG
+                # --- Advance parser index PAST the 'config vdom' line BEFORE calling handler ---
+                self.i += 1 
                 self._handle_vdom_config()
                 self.current_vdom = None # Reset VDOM context after the block
                 last_successful_line = self.i
@@ -151,9 +153,11 @@ class FortiParser:
                 self.i += 1 # Consume 'config global'
                 # TODO: Optionally handle settings directly under 'config global' if they exist
                 # Need to check if 'config global' contains only 'config' blocks or also 'set' commands
+                # For now, assume it's just a container like VDOMs, main loop handles inner blocks.
+                # If 'set' commands are allowed here, we'd need a read_settings loop until 'end'.
                 last_successful_line = self.i
-                if self.debug: print(f"[L{self.i}] Exiting Global config") # DEBUG
-                continue
+                # if self.debug: print(f"[L{self.i}] Exiting Global config") # DEBUG # This message might be premature
+                continue # Let main loop handle sections inside 'config global'
 
             elif m_section:
                 # --- Regular Section Parsing --- #
@@ -168,16 +172,22 @@ class FortiParser:
                 handler = getattr(self, handler_method_name, None)
                 if self.debug: print(f"[L{original_line_index+1}] Matched section: '{raw_section_name}' -> Handler: {handler_method_name if handler else 'Generic/None'}") # DEBUG
 
+                # --- Advance parser index PAST the 'config ...' line BEFORE calling handler ---
+                self.i += 1
+                start_block_content_index = self.i # Mark where the block's content starts
+
                 if handler:
                     try:
-                        handler() # Call the specific or generic handler
-                        # Handler should advance self.i past the section's end
+                        handler() # Call the specific handler
+                        # Handler should call read_block/read_settings which advances self.i past the section's end
                         last_successful_line = self.i
                     except Exception as e:
                         print(f"ERROR: Handler {handler_method_name} failed processing section '{raw_section_name}' starting near line {original_line_index + 1}: {e}", file=sys.stderr)
                         print(f"Attempting to recover by skipping to next likely block start or end...", file=sys.stderr)
                         # --- Recovery Attempt --- #
-                        self.i = original_line_index # Reset i to start of failed section
+                        # Reset i to the line that caused the error (the 'config' line)
+                        # before attempting to skip the whole block.
+                        self.i = original_line_index 
                         if not self._skip_to_next_block_or_end():
                              print(f"FATAL: Recovery failed. Could not find next block after error at line {original_line_index + 1}. Stopping parse.", file=sys.stderr)
                              return self.model # Return partially parsed model
@@ -186,7 +196,8 @@ class FortiParser:
                     # No specific handler found, use generic (which also calls _read_block/_read_settings)
                     if self.debug: print(f"[L{original_line_index+1}] Using generic handler for section '{raw_section_name}'", file=sys.stderr) # DEBUG
                     try:
-                        self._handle_generic_section(raw_section_name, normalized_section_name)
+                        # Generic handler needs the content start index to know where to read from
+                        self._handle_generic_section(raw_section_name, normalized_section_name, start_block_content_index)
                         last_successful_line = self.i
                     except Exception as e:
                          print(f"ERROR: Generic handler failed processing section '{raw_section_name}' starting near line {original_line_index + 1}: {e}", file=sys.stderr)
@@ -200,10 +211,18 @@ class FortiParser:
 
             elif m_end:
                 # Encountered an 'end' at the top level or VDOM level inappropriately
-                print(f"Warning [Line {original_line_index + 1}]: Encountered unexpected 'end' statement outside of a config block. Skipping.", file=sys.stderr)
-                self.i += 1
-                last_successful_line = self.i
-                continue
+                # Or potentially the 'end' for 'config global' if it doesn't contain nested blocks
+                if self.current_vdom == 'global':
+                    if self.debug: print(f"[L{original_line_index+1}] Found 'end' for global config.") # DEBUG
+                    self.current_vdom = None # Exit global context
+                    self.i += 1
+                    last_successful_line = self.i
+                    continue
+                else:
+                    print(f"Warning [Line {original_line_index + 1}]: Encountered unexpected 'end' statement outside of a config block. Skipping.", file=sys.stderr)
+                    self.i += 1
+                    last_successful_line = self.i
+                    continue
 
             # --- Handle unexpected lines --- #
             else:
@@ -233,11 +252,13 @@ class FortiParser:
     # --- VDOM Handling Method --- 
     def _handle_vdom_config(self):
         """Handles the 'config vdom' block, including 'edit <vdom_name>' entries and their nested configs."""
-        self.i += 1 # Move past 'config vdom'
+        # Assumes 'config vdom' line was already consumed, self.i points to the next line.
+        vdom_block_start_line = self.i # For debug
         self.model.has_vdoms = True # Mark VDOMs enabled
 
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
+            original_line_index = self.i
             
             if self.END_RE.match(line):
                 self.i += 1 # Consume 'end' for 'config vdom'
@@ -252,479 +273,824 @@ class FortiParser:
                 if self.current_vdom not in self.model.vdoms:
                      self.model.vdoms[self.current_vdom] = ConfigModel()
 
+                # Loop for lines within the 'edit <vdom_name>' block
                 while self.i < len(self.lines):
                     inner_line = self.lines[self.i].strip()
-                    
+                    inner_line_index = self.i
+
+                    # Check for end of this VDOM entry ('next') or end of entire VDOM block ('end')
                     if self.NEXT_RE.match(inner_line):
                         self.i += 1
-                        break
+                        break # Exit inner loop, go to next VDOM edit or VDOM end
+                    if self.END_RE.match(inner_line): # If 'end' found here, it terminates the whole 'config vdom'
+                        if self.debug: print(f"Found 'end' prematurely inside VDOM '{vdom_name}' at line {self.i+1}. Terminating VDOM parse.") # DEBUG
+                        return # Exit handler completely
 
-                    if self.END_RE.match(inner_line):
-                         return
-
+                    # Handle config sections inside the VDOM
                     m_section = self.SECTION_RE.match(inner_line)
                     if m_section:
-                         raw_section_name = m_section.group(1).strip()
+                         raw_section_name = m_section.group(1).strip().replace('"', '') # Remove quotes
                          normalized_section_name = raw_section_name.lower().replace(' ', '_').replace('-', '_')
                          handler_method_name = self.SECTION_ALIASES.get(normalized_section_name) or f'_handle_{normalized_section_name}'
                          handler = getattr(self, handler_method_name, None)
+                         
+                         # --- Advance parser index PAST the 'config ...' line BEFORE calling handler ---
+                         self.i += 1
+                         start_block_content_index = self.i # Mark where the block's content starts
 
                          if handler:
                              try: 
-                                 handler()
+                                 handler() # Handler calls read_block/read_settings
                              except Exception as e:
-                                  print(f"ERROR: VDOM Handler {handler_method_name} failed for section '{raw_section_name}': {e}", file=sys.stderr)
-                                  self._skip_block()
+                                  print(f"ERROR: VDOM Handler {handler_method_name} failed for section '{raw_section_name}' in VDOM '{vdom_name}': {e}", file=sys.stderr)
+                                  # Attempt recovery within VDOM context
+                                  self.i = inner_line_index # Reset to 'config' line
+                                  if not self._skip_to_next_block_or_end(): # Try skipping the failed block
+                                      print(f"FATAL: Recovery failed within VDOM '{vdom_name}'. Skipping rest of VDOM.", file=sys.stderr)
+                                      # How to cleanly break to the next 'edit' or 'end'?
+                                      # Search for 'next' or 'end' from current position
+                                      found_next_or_end = False
+                                      while self.i < len(self.lines):
+                                          scan_line = self.lines[self.i].strip()
+                                          if self.NEXT_RE.match(scan_line):
+                                              self.i += 1; found_next_or_end = True; break
+                                          if self.END_RE.match(scan_line):
+                                              # Don't consume end here, let outer loop handle it
+                                              found_next_or_end = True; break 
+                                          self.i += 1
+                                      if found_next_or_end: break # Break inner VDOM loop
+                                      else: return # Reached EOF during VDOM recovery, exit handler
+                                  else:
+                                      print(f"Recovered within VDOM: Skipped to line {self.i + 1}.", file=sys.stderr)
+                                      # Continue inner VDOM loop from the recovered position
                          else:
-                              self._handle_generic_section(raw_section_name, normalized_section_name)
-                         continue
+                              # Generic handler for sections inside VDOM
+                              self._handle_generic_section(raw_section_name, normalized_section_name, start_block_content_index)
+                         continue # Continue inner VDOM loop after handling section
+
+                    # Skip comments/empty lines within VDOM entry
                     if not inner_line or inner_line.startswith('#'):
                          self.i += 1
                          continue
                          
-                    print(f"Warning: Skipping unexpected line inside VDOM '{self.current_vdom}' entry at line {self.i+1}: {inner_line}")
+                    # Handle unexpected lines within VDOM entry
+                    print(f"Warning: Skipping unexpected line inside VDOM '{self.current_vdom}' entry at line {self.i+1}: {inner_line}", file=sys.stderr)
                     self.i += 1 
-                # End of inner loop (after 'next' or reaching 'end')
+                # End of inner VDOM loop (after 'next' or recovery skip)
             
+            # Skip comments/empty lines directly under 'config vdom'
             elif not line or line.startswith('#'):
                  self.i += 1
                  continue
             
+            # Handle unexpected lines directly under 'config vdom' (e.g., before first 'edit')
             else:
-                print(f"Warning: Skipping unexpected line inside 'config vdom' block at line {self.i+1}: {line}")
+                print(f"Warning: Skipping unexpected line inside 'config vdom' block at line {self.i+1}: {line}", file=sys.stderr)
                 self.i += 1
 
         print("Warning: Reached end of file while inside 'config vdom' block.", file=sys.stderr)
         self.current_vdom = None # Clear context
         
-    # --- Block Reading Helpers --- 
-    def _skip_block(self):
-        """(Deprecated - Use _skip_to_next_block_or_end) Skip lines until the matching 'end' is found. Basic version."""
-        print("DEPRECATION WARNING: _skip_block() called. Use _skip_to_next_block_or_end() for better recovery.", file=sys.stderr)
-        nesting_level = 1
-        # self.i should be at the line *after* the failed 'config' line when this is called by old logic
-        start_line = self.i
-        while self.i < len(self.lines):
-            line = self.lines[self.i].strip()
-            # Use SECTION_RE to correctly identify nested config starts
-            if self.SECTION_RE.match(line):
-                nesting_level += 1
-            elif self.END_RE.match(line):
-                nesting_level -= 1
-                if nesting_level == 0:
-                    self.i += 1 # Consume the final 'end'
-                    print(f"_skip_block: Skipped from {start_line +1} to {self.i + 1}", file=sys.stderr)
-                    return True # Successfully skipped the block
-            self.i += 1
-        print(f"Warning: Reached end of file while skipping block starting near line {start_line + 1}. Nesting level: {nesting_level}", file=sys.stderr)
-        return False # Failed to find matching end
+    # --- Value Parsing Helper ---
+    def _parse_set_value(self, key, raw_val, line_num):
+        """Parses the value string from a 'set' command."""
+        # Reuse the robust value parsing logic
+        if raw_val.startswith('"') and raw_val.endswith('"'):
+            # Handle edge case of empty quoted string "" -> empty string
+            val = raw_val[1:-1] 
+        elif ' ' in raw_val:
+            # Try splitting respecting quotes
+            split_vals = []
+            current_val = ''
+            in_quotes = False
+            escape = False
+            for char in raw_val:
+                if char == '\\' and not escape:
+                    escape = True # Next char is escaped
+                elif char == '"' and not escape:
+                    in_quotes = not in_quotes
+                    # Keep quotes as part of the value if they are internal?
+                    # For now, let's strip leading/trailing quotes later if needed.
+                    current_val += char 
+                elif char == ' ' and not in_quotes:
+                    if current_val: # Append if non-empty
+                        # Strip surrounding quotes from the completed value segment if present
+                        if current_val.startswith('"') and current_val.endswith('"'):
+                             split_vals.append(current_val[1:-1])
+                        else:
+                             split_vals.append(current_val)
+                    current_val = ''
+                else:
+                    current_val += char
+                    escape = False # Reset escape flag
+            if current_val: # Append the last part
+                # Strip surrounding quotes from the last segment
+                if current_val.startswith('"') and current_val.endswith('"'):
+                     split_vals.append(current_val[1:-1])
+                else:
+                     split_vals.append(current_val)
 
-    def _skip_to_next_block_or_end(self):
-        """Robustly skips the current block or malformed lines until the next 'config' or top-level 'end'.
+            # Handle specific key cases after splitting
+            if key in ['ip', 'subnet'] and len(split_vals) == 2:
+                ip_part, mask_part = split_vals[0], split_vals[1]
+                try:
+                    prefix = self._mask_to_prefix(mask_part)
+                    if prefix is not None:
+                        ipaddress.ip_address(ip_part) # Validate IP
+                        val = f"{ip_part}/{prefix}"
+                    else:
+                        # Mask conversion failed, store as is
+                        val = f"{ip_part}/{mask_part}" # Store original mask if invalid
+                except ValueError: # Invalid IP address
+                    print(f"Warning [Line {line_num}]: Invalid IP address format '{ip_part}' in '{ip_part} {mask_part}' for key '{key}'. Storing as is.", file=sys.stderr)
+                    val = f"{ip_part}/{mask_part}"
+            elif len(split_vals) > 1:
+                # Multiple values after splitting, treat as list
+                val = split_vals
+            else:
+                # Only one value after splitting (might contain spaces if quotes were weird)
+                # Strip surrounding quotes if they remain
+                single_val = split_vals[0] if split_vals else raw_val # Fallback to raw_val if split failed
+                if single_val.startswith('"') and single_val.endswith('"'):
+                     val = single_val[1:-1]
+                else:
+                     val = single_val
+        else:
+            # Simple single value, no spaces or quotes
+            val = raw_val
+        return val
         
-        Assumes self.i is at the start of the problematic line/block.
-        Advances self.i to the beginning of the next valid block or EOF.
-        Returns True if recovery seems successful, False otherwise.
-        """
-        original_line_index = self.i
-        nesting_level = 1 # Assume we are inside the block that failed to parse
-        print(f"_skip_to_next_block_or_end: Starting recovery from line {original_line_index + 1}...", file=sys.stderr)
-        
-        self.i += 1 # Start searching from the next line
-        while self.i < len(self.lines):
-            line = self.lines[self.i].strip()
-
-            # Skip comments and empty lines during search
-            if not line or line.startswith('#'):
-                self.i += 1
-                continue
-
-            # Check for nested config start
-            if self.SECTION_RE.match(line):
-                 nesting_level += 1
-                 print(f"_skip: Nested config found at line {self.i+1}, level -> {nesting_level}", file=sys.stderr) # DEBUG
-            # Check for end command
-            elif self.END_RE.match(line):
-                 nesting_level -= 1
-                 print(f"_skip: End found at line {self.i+1}, level -> {nesting_level}", file=sys.stderr) # DEBUG
-                 if nesting_level == 0:
-                     # Found the end of the block we were trying to skip
-                     self.i += 1 # Consume the 'end'
-                     print(f"_skip_to_next_block_or_end: Found matching 'end' at line {self.i}. Resuming parse.", file=sys.stderr)
-                     return True
-                 elif nesting_level < 0:
-                      # Too many ends - indicates a malformed structure earlier
-                      print(f"Warning [Line {self.i+1}]: Encountered unexpected 'end' during skip recovery (nesting level {nesting_level}). Possible config corruption.", file=sys.stderr)
-                      # Treat this as potentially the end of the faulty block anyway?
-                      self.i += 1
-                      return True # Attempt to continue
-
-            # If nesting level is back to 0 (or less), look for the *next* config block start
-            if nesting_level <= 0:
-                 if self.SECTION_RE.match(line) or self.VDOM_CONFIG_RE.match(line) or self.GLOBAL_CONFIG_RE.match(line):
-                     print(f"_skip_to_next_block_or_end: Found next config block at line {self.i + 1}. Resuming parse before this line.", file=sys.stderr)
-                     # Do *not* consume this line, the main loop should handle it
-                     return True
-
-            # Keep searching
-            self.i += 1
-
-        # Reached EOF
-        print(f"Warning: Reached end of file during skip recovery starting from line {original_line_index + 1}. Final nesting level: {nesting_level}", file=sys.stderr)
-        return False # Indicate recovery might not position parser correctly
+    # --- Block Reading Helpers (with fallback) --- 
 
     def _read_block(self):
-        """Read a block of settings for a list-based config section (e.g., firewall policy)."""
-        items = []
-        block_start_line = self.i # For debug
-        # We assume the 'config <section>' line was already consumed by the caller
-        # self.i += 1 - NO LONGER NEEDED HERE
-        current_item = None
-        nesting_level = 1
-        if self.debug: print(f" >> Enter _read_block @ L{block_start_line+1}, Level {nesting_level}") # DEBUG
+        """Read a block of settings for a list-based config section (e.g., firewall policy).
+           Includes fallback to iterative parsing if recursion depth is exceeded.
+        """
+        block_start_line_index = self.i # Store starting line index (points to first line *after* 'config ...')
+        try:
+            # --- Original Recursive Logic ---
+            items = []
+            current_item = None
+            nesting_level = 1
+            if self.debug: print(f" >> Enter _read_block (Recursive) @ L{block_start_line_index+1}, Level {nesting_level}")
 
-        while self.i < len(self.lines):
-            line = self.lines[self.i].strip()
-            if self.debug: print(f"    [L{self.i+1}, Lvl {nesting_level}] Read: {line}") # DEBUG
-            current_item_id = current_item.get('id', current_item.get('name', 'None')) if current_item else 'None'
+            while self.i < len(self.lines):
+                line = self.lines[self.i].strip()
+                original_line_index = self.i # Track line for error messages
+                if self.debug: print(f"    [L{self.i+1}, Lvl {nesting_level}] Read: {line}")
+                current_item_id = current_item.get('id', current_item.get('name', 'None')) if current_item else 'None'
 
-            # Handle nested config blocks first
-            if line.startswith('config '):
-                 nesting_level += 1
-                 # Extract nested section name (handle potential quotes)
-                 match_nested_section = self.SECTION_RE.match(line)
-                 if match_nested_section:
-                     nested_section_name = match_nested_section.group(1).strip().replace('"', '') # Remove quotes if present
-                 else:
-                     # Fallback or log warning if SECTION_RE fails (shouldn't happen often)
-                     print(f"Warning [Line {self.i+1}]: Could not properly extract nested section name from: {line}", file=sys.stderr)
-                     nested_section_name = line.split(None, 1)[1].strip()
+                # Handle nested config blocks first
+                if line.startswith('config '):
+                     nesting_level += 1
+                     match_nested_section = self.SECTION_RE.match(line)
+                     if match_nested_section: nested_section_name = match_nested_section.group(1).strip().replace('"', '')
+                     else: 
+                          print(f"Warning [Line {original_line_index+1}]: Could not parse nested section name: {line}", file=sys.stderr)
+                          nested_section_name = line.split(None, 1)[1].strip() if len(line.split()) > 1 else "unknown_nested"
+                     nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
 
-                 nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+                     # Advance past nested 'config' line before recursive call
+                     self.i += 1 
+                     
+                     peek_i = self.i; is_list_block = False
+                     while peek_i < len(self.lines):
+                         peek_line = self.lines[peek_i].strip(); peek_i += 1
+                         if not peek_line or peek_line.startswith('#'): continue
+                         if self.EDIT_RE.match(peek_line): is_list_block = True
+                         break
 
-                 # Determine if nested block is list or settings
-                 peek_i = self.i + 1
-                 is_list_block = False
-                 while peek_i < len(self.lines):
-                     peek_line = self.lines[peek_i].strip()
-                     if not peek_line or peek_line.startswith('#'):
-                         peek_i += 1
-                         continue
-                     if self.EDIT_RE.match(peek_line):
-                         is_list_block = True
-                     break # Found first significant line
+                     # --- Recursive Call ---
+                     if is_list_block: nested_data = self._read_block() # <<< RECURSION
+                     else: nested_data = self._read_settings() # <<< RECURSION
+                     # --- End Recursive Call ---
 
-                 # Recursively read the nested block
-                 if is_list_block:
-                     nested_data = self._read_block()
-                 else:
-                     nested_data = self._read_settings()
+                     nesting_level -= 1 # Decrement level after recursive call returns
+                     if current_item is not None: 
+                          # Check if key already exists (e.g., multiple 'config members' blocks)
+                          if nested_key in current_item:
+                               # If existing value is not a list, make it one
+                               if not isinstance(current_item[nested_key], list):
+                                    current_item[nested_key] = [current_item[nested_key]]
+                               # Append new data (assuming nested_data is a list or dict)
+                               current_item[nested_key].append(nested_data) 
+                          else:
+                              current_item[nested_key] = nested_data
+                     else: 
+                          # Nested config outside an 'edit' item - unusual
+                          print(f"Warning [Line {original_line_index+1}]: Nested config block '{nested_section_name}' found outside an 'edit' item. Storing may be ambiguous.", file=sys.stderr)
+                     
+                     # self.i was advanced by recursive call, so continue main loop
+                     continue 
 
-                 nesting_level -= 1 # Decrement after the recursive call returns
+                m_edit = self.EDIT_RE.match(line)
+                m_set = self.SET_RE.match(line)
+                m_append = self.APPEND_RE.match(line)
+                m_unset = self.UNSET_RE.match(line)
+                m_next = self.NEXT_RE.match(line)
+                m_end = self.END_RE.match(line)
 
-                 if current_item is not None:
-                     # Store nested data under the normalized key
-                     # Handle potential conflicts if key exists? Overwrite for now.
-                     current_item[nested_key] = nested_data
-                 else:
-                     # This case (nested config outside an 'edit' item) might be unusual
-                     # Store it at the list level? Needs investigation based on FortiOS structure.
-                     print(f"Warning [Line {self.i+1}]: Nested config block '{nested_section_name}' found outside an 'edit' item. Storing may be ambiguous.", file=sys.stderr)
-                     # Perhaps store with a special key in the last item? Or create a dummy item?
-                     # Safest for now is to potentially lose it if not inside an item.
-
-                 # Check if recursive call consumed the 'end' line appropriately
-                 # The recursive call should place self.i *after* the 'end' it consumed.
-                 # No need to increment self.i here, the recursive call did it.
-                 continue # Continue to the next line after the nested block
-
-            # --- Match Standard Commands ---
-            m_edit = self.EDIT_RE.match(line)
-            m_set = self.SET_RE.match(line)
-            m_append = self.APPEND_RE.match(line) # ADDED APPEND
-            m_unset = self.UNSET_RE.match(line)   # ADDED UNSET
-            m_next = self.NEXT_RE.match(line)
-            m_end = self.END_RE.match(line)
-
-            if m_edit:
-                if current_item is not None:
-                    items.append(current_item) # Save previous item
-                edit_val = m_edit.group(1) or m_edit.group(2) # Quoted or unquoted name
-                # Determine if the edit value is likely an integer ID or a string name
-                id_key = 'id' if edit_val.isdigit() else 'name'
-                current_item = {id_key: edit_val}
-            elif m_set and current_item is not None:
-                key = m_set.group(1).replace('-', '_') # Normalize key
-                raw_val = m_set.group(2).strip()     # Get the raw value part
-
-                # --- Robust Value Parsing ---
-                # 1. Handle explicitly quoted single values
-                if raw_val.startswith('"') and raw_val.endswith('"'):
-                    val = raw_val[1:-1]
-                # 2. Handle multi-word values, potentially with quotes inside
-                elif ' ' in raw_val:
-                    # Try splitting respecting quotes
-                    split_vals = []
-                    current_val = ''
-                    in_quotes = False
-                    for char in raw_val:
-                        if char == '"':
-                            in_quotes = not in_quotes
-                        elif char == ' ' and not in_quotes:
-                            if current_val: # Append if non-empty
-                                split_vals.append(current_val)
-                            current_val = ''
-                        else:
-                            current_val += char
-                    if current_val: # Append the last part
-                        split_vals.append(current_val)
-
-                    # Special case: 'set ip <ip> <mask>' or 'set subnet <ip> <mask>'
-                    if key in ['ip', 'subnet'] and len(split_vals) == 2:
-                        ip_part = split_vals[0]
-                        mask_part = split_vals[1]
-                        try:
-                            prefix = self._mask_to_prefix(mask_part)
-                            if prefix is not None:
-                                # Validate the IP part as well
-                                ipaddress.ip_address(ip_part)
-                                val = f"{ip_part}/{prefix}" # Store as ip/prefix string
-                            else:
-                                val = f"{ip_part}/{mask_part}" # Store as ip/mask if conversion failed
-                                # Warning printed in _mask_to_prefix
-                        except ValueError:
-                            print(f"Warning [Line {self.i+1}]: Invalid IP/mask format '{ip_part} {mask_part}' for key '{key}'. Storing as is.", file=sys.stderr)
-                            val = f"{ip_part}/{mask_part}" # Store the potentially problematic value
-                    # If multiple values remain after splitting, store as list
-                    elif len(split_vals) > 1:
-                         # Check if it looks like multiple simple values (e.g., set member a b c)
-                         # or a single value that happened to contain spaces but wasn't fully quoted
-                         # Heuristic: If no internal quotes were detected, treat as list.
-                         # If internal quotes were involved, maybe treat as single string? Needs refinement.
-                         # For now, assume space separation means list if not fully quoted start/end.
-                        val = split_vals
-                    # Otherwise, treat as single value (might have spaces if improperly quoted)
-                    else:
-                        val = raw_val # Store the raw value if splitting logic didn't produce multiple items
-                # 3. Handle simple single values
+                if m_edit:
+                    if current_item is not None:
+                        items.append(current_item) # Save previous item
+                    edit_val = m_edit.group(1) or m_edit.group(2) # Quoted or unquoted name
+                    id_key = 'id' if edit_val.isdigit() else 'name'
+                    current_item = {id_key: edit_val}
+                elif m_set and current_item is not None:
+                    key = m_set.group(1).replace('-', '_') # Normalize key
+                    raw_val = m_set.group(2).strip()     # Get the raw value part
+                    val = self._parse_set_value(key, raw_val, original_line_index + 1) # Use helper
+                    current_item[key] = val
+                elif m_append and current_item is not None:
+                     key = m_append.group(1).replace('-', '_'); raw_val = m_append.group(2).strip()
+                     # Simple append value parsing for now (treat as string)
+                     if raw_val.startswith('"') and raw_val.endswith('"'): append_val = raw_val[1:-1]
+                     else: append_val = raw_val
+                     # Ensure key exists as a list and append
+                     if key not in current_item: current_item[key] = []
+                     elif not isinstance(current_item[key], list): current_item[key] = [current_item[key]]
+                     current_item[key].append(append_val)
+                elif m_unset and current_item is not None:
+                     key = m_unset.group(1).replace('-', '_')
+                     if key in current_item: del current_item[key] # Remove the key
+                elif m_next:
+                     if current_item is not None: items.append(current_item)
+                     current_item = None # Reset for the next item
+                elif m_end:
+                     nesting_level -= 1
+                     if self.debug: print(f"       -> Found 'end', level -> {nesting_level}") # DEBUG
+                     if nesting_level == 0:
+                         if current_item is not None: items.append(current_item) # Append the last item
+                         self.i += 1 # Consume 'end'
+                         if self.debug: print(f" << Exit _read_block (Rec, found final end) @ L{self.i}, Lvl {nesting_level}")
+                         return items # Return list of parsed items
+                     # else: This 'end' closes a nested block handled earlier. Just let loop continue.
+                elif not line or line.startswith('#'):
+                     pass # Skip comments and empty lines
                 else:
-                    val = raw_val
+                     # Handle unexpected lines
+                     print(f"Warning [Line {original_line_index + 1}]: Skipping unexpected line inside recursive block for item '{current_item_id}': {line}", file=sys.stderr)
 
-                # Store the processed value
-                current_item[key] = val
-                if self.debug: print(f"       -> Stored set: {key} = {val}") # DEBUG
+                # Only advance if not continuing after nested block
+                if not line.startswith('config '):
+                     self.i += 1 # Move to the next line
 
-            # --- Handle append/unset (Store differently for potential diffing?) ---
-            elif m_append and current_item is not None:
-                 key = m_append.group(1).replace('-', '_')
-                 raw_val = m_append.group(2).strip()
-                 # Parse value similar to 'set'
-                 if raw_val.startswith('"') and raw_val.endswith('"'):
-                     append_val = raw_val[1:-1]
-                 else:
-                     # Simplified: treat appended value as single string for now
-                     # TODO: Enhance parsing if lists can be appended piece by piece
-                     append_val = raw_val
+            # End of loop (likely reached EOF)
+            print(f"Warning: Reached end of file while reading block (Rec, nesting level {nesting_level}). Block started near {block_start_line_index+1}", file=sys.stderr)
+            if current_item is not None:
+                items.append(current_item) # Append the last item if loop terminated abruptly
+            if self.debug: print(f" << Exit _read_block (Rec, EOF) @ L{self.i}, Lvl {nesting_level}")
+            return items
+            # --- End Original Recursive Logic ---
 
-                 # Store append operations - maybe in a separate structure or flag?
-                 # Simple approach: Ensure key exists as a list and append
-                 if key not in current_item:
-                     current_item[key] = []
-                 elif not isinstance(current_item[key], list):
-                     # Promote existing single value to list
-                     current_item[key] = [current_item[key]]
-                 current_item[key].append(append_val)
-                 if self.debug: print(f"       -> Handled append for key '{key}', value '{append_val}'") # DEBUG
-
-            elif m_unset and current_item is not None:
-                 key = m_unset.group(1).replace('-', '_')
-                 # Mark the key as unset? Or remove it? Removing is simpler for final state.
-                 if key in current_item:
-                     del current_item[key]
-                 # TODO: Store unset operations if needed for diffing
-                 if self.debug: print(f"       -> Handled unset for key '{key}'") # DEBUG
-
-            elif m_next:
-                 if current_item is not None:
-                     items.append(current_item)
-                 current_item = None # Reset for the next item
-            elif m_end:
-                 nesting_level -= 1
-                 if nesting_level == 0:
-                     if current_item is not None:
-                         items.append(current_item) # Append the last item
-                     self.i += 1 # Consume 'end'
-                     if self.debug: print(f" << Exit _read_block (found end) @ L{self.i}, Final Level {nesting_level}") # DEBUG
-                     return items # Return list of parsed items
-                 else:
-                     # This 'end' closes a nested block handled earlier. Just continue.
-                     pass
-            elif not line or line.startswith('#'):
-                 pass # Skip comments and empty lines
-            # --- ADDED: Handle unexpected lines ---
-            else:
-                 print(f"Warning [Line {self.i+1}]: Skipping unexpected line inside block for item '{current_item_id}': {line}", file=sys.stderr)
-
-            self.i += 1 # Move to the next line
-
-        # End of loop (likely reached EOF)
-        print(f"Warning: Reached end of file while reading block (nesting level {nesting_level}).", file=sys.stderr)
-        if current_item is not None:
-            items.append(current_item) # Append the last item if loop terminated abruptly
-        if self.debug: print(f" << Exit _read_block (EOF) @ L{self.i}, Final Level {nesting_level}") # DEBUG
-        return items
+        except RecursionError:
+            print(f"Warning: Recursion depth limit exceeded while parsing block starting near line {block_start_line_index}. Falling back to iterative parsing.", file=sys.stderr)
+            # Reset parser position to the start of the block's content
+            self.i = block_start_line_index 
+            return self._read_block_iterative(block_start_line_index) # Call iterative version
+        except Exception as e:
+             print(f"ERROR during recursive _read_block near line {self.i+1} (started {block_start_line_index+1}): {e}", file=sys.stderr)
+             raise # Re-raise other exceptions
 
     def _read_settings(self):
-        """Read a block of settings for a single-item config section (e.g., system dns)."""
-        settings = {}
-        block_start_line = self.i # For debug
-        # We assume the 'config <section>' line was already consumed by the caller
-        # self.i += 1 - NO LONGER NEEDED HERE
-        nesting_level = 1
-        if self.debug: print(f" >> Enter _read_settings @ L{block_start_line+1}, Level {nesting_level}") # DEBUG
+        """Read a block of settings for a single-item config section (e.g., system dns).
+           Includes fallback to iterative parsing if recursion depth is exceeded.
+        """
+        block_start_line_index = self.i # Store starting line index (points to first line *after* 'config ...')
+        try:
+            # --- Original Recursive Logic ---
+            settings = {}
+            nesting_level = 1
+            if self.debug: print(f" >> Enter _read_settings (Recursive) @ L{block_start_line_index+1}, Level {nesting_level}")
+
+            while self.i < len(self.lines):
+                line = self.lines[self.i].strip()
+                original_line_index = self.i # Track line for error messages
+                if self.debug: print(f"    [L{self.i+1}, Lvl {nesting_level}] Read: {line}")
+
+                # Handle nested config blocks first
+                if line.startswith('config '):
+                     nesting_level += 1
+                     match_nested_section = self.SECTION_RE.match(line)
+                     if match_nested_section: nested_section_name = match_nested_section.group(1).strip().replace('"', '')
+                     else: 
+                          print(f"Warning [Line {original_line_index+1}]: Could not parse nested section name: {line}", file=sys.stderr)
+                          nested_section_name = line.split(None, 1)[1].strip() if len(line.split()) > 1 else "unknown_nested"
+                     nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+                     
+                     # Advance past nested 'config' line before recursive call
+                     self.i += 1 
+
+                     peek_i = self.i; is_list_block = False
+                     while peek_i < len(self.lines):
+                         peek_line = self.lines[peek_i].strip(); peek_i += 1
+                         if not peek_line or peek_line.startswith('#'): continue
+                         if self.EDIT_RE.match(peek_line): is_list_block = True
+                         break
+
+                     # --- Recursive Call ---
+                     if is_list_block: nested_data = self._read_block() # <<< RECURSION
+                     else: nested_data = self._read_settings() # <<< RECURSION
+                     # --- End Recursive Call ---
+
+                     nesting_level -= 1 # Decrement level after recursive call returns
+                     # Store nested data under the normalized key
+                     # Handle multiple nested blocks with same name (e.g., 'config entries')
+                     if nested_key in settings:
+                          if not isinstance(settings[nested_key], list):
+                               settings[nested_key] = [settings[nested_key]]
+                          settings[nested_key].append(nested_data)
+                     else:
+                         settings[nested_key] = nested_data
+                     
+                     # self.i was advanced by recursive call, so continue main loop
+                     continue 
+
+                m_set = self.SET_RE.match(line)
+                m_append = self.APPEND_RE.match(line)
+                m_unset = self.UNSET_RE.match(line)
+                m_end = self.END_RE.match(line)
+
+                if m_set:
+                    key = m_set.group(1).replace('-', '_') # Normalize key
+                    raw_val = m_set.group(2).strip()     # Get the raw value part
+                    val = self._parse_set_value(key, raw_val, original_line_index + 1) # Use helper
+                    settings[key] = val
+                elif m_append:
+                     key = m_append.group(1).replace('-', '_'); raw_val = m_append.group(2).strip()
+                     if raw_val.startswith('"') and raw_val.endswith('"'): append_val = raw_val[1:-1]
+                     else: append_val = raw_val
+                     # Ensure key exists as a list and append
+                     if key not in settings: settings[key] = []
+                     elif not isinstance(settings[key], list): settings[key] = [settings[key]]
+                     settings[key].append(append_val)
+                elif m_unset:
+                     key = m_unset.group(1).replace('-', '_')
+                     if key in settings: del settings[key] # Remove the key
+                elif m_end:
+                     nesting_level -= 1
+                     if self.debug: print(f"       -> Found 'end', level -> {nesting_level}") # DEBUG
+                     if nesting_level == 0:
+                         self.i += 1 # Consume 'end'
+                         if self.debug: print(f" << Exit _read_settings (Rec, found final end) @ L{self.i}, Lvl {nesting_level}")
+                         return settings # Return the dictionary of settings
+                     # else: This 'end' closes a nested block. Let loop continue.
+                elif not line or line.startswith('#'):
+                     pass # Skip comments and empty lines
+                else:
+                     # Handle unexpected lines
+                     print(f"Warning [Line {original_line_index + 1}]: Skipping unexpected line inside recursive settings block: {line}", file=sys.stderr)
+
+                # Only advance if not continuing after nested block
+                if not line.startswith('config '):
+                    self.i += 1 # Move to the next line
+
+            # End of loop (likely reached EOF)
+            print(f"Warning: Reached end of file while reading settings (Rec, nesting level {nesting_level}). Block started near {block_start_line_index+1}", file=sys.stderr)
+            if self.debug: print(f" << Exit _read_settings (Rec, EOF) @ L{self.i}, Lvl {nesting_level}")
+            return settings
+            # --- End Original Recursive Logic ---
+
+        except RecursionError:
+            print(f"Warning: Recursion depth limit exceeded while parsing settings block starting near line {block_start_line_index}. Falling back to iterative parsing.", file=sys.stderr)
+            # Reset parser position to the start of the block's content
+            self.i = block_start_line_index
+            return self._read_settings_iterative(block_start_line_index) # Call iterative version
+        except Exception as e:
+             print(f"ERROR during recursive _read_settings near line {self.i+1} (started {block_start_line_index+1}): {e}", file=sys.stderr)
+             raise # Re-raise other exceptions
+
+    # --- Iterative Parsers (Fallback) ---
+
+    def _read_block_iterative(self, block_start_line_index):
+        """Iteratively read a block of settings for a list-based config section."""
+        if self.debug: print(f" >> Enter _read_block_iterative @ L{block_start_line_index + 1}") # DEBUG
+        
+        items = []
+        # Stack stores dictionaries representing the current parsing context.
+        # Each dict has 'type' ('list_item', 'nested_list', 'nested_settings')
+        # and 'data' (the list/dict being built or None for top level).
+        # List contexts also store 'current_item'.
+        stack = [{'type': 'list_item', 'data': items, 'current_item': None}] # Start with the main list context
+        self.i = block_start_line_index # Ensure parser is at the start of the block content
 
         while self.i < len(self.lines):
             line = self.lines[self.i].strip()
-            if self.debug: print(f"    [L{self.i+1}, Lvl {nesting_level}] Read: {line}") # DEBUG
+            original_line_index = self.i
+            
+            # Get current context from stack top
+            if not stack: # Should not happen if logic is correct
+                 print(f"ERROR: Parser stack empty during iterative read near line {original_line_index+1}. Aborting block.", file=sys.stderr)
+                 # Attempt recovery by finding next end? For now, just return what we have.
+                 return items 
+                 
+            current_context = stack[-1]
+            context_type = current_context['type']
+            # Target dictionary for 'set'/'append'/'unset' depends on context
+            target_dict_for_set = None
+            if context_type in ['list_item', 'nested_list']:
+                 target_dict_for_set = current_context.get('current_item')
+            elif context_type == 'nested_settings':
+                 target_dict_for_set = current_context.get('data')
 
-            # Handle nested config blocks first
+            if self.debug: 
+                 context_id_str = "N/A"
+                 if target_dict_for_set:
+                      context_id_str = target_dict_for_set.get('id', target_dict_for_set.get('name', '...'))
+                 elif context_type == 'list_item': context_id_str = "TopLevelList"
+                 elif context_type == 'nested_list': context_id_str = "NestedList"
+                 elif context_type == 'nested_settings': context_id_str = "NestedSettings"
+                 print(f"    [L{self.i+1}, StackLvl {len(stack)}] Iter Ctx: {context_type} ({context_id_str}) | Read: {line}") # DEBUG
+
+            # --- Handle Block Control Commands ---
+            
+            # Handle nested config blocks
             if line.startswith('config '):
-                 nesting_level += 1
-                 # Extract nested section name (handle potential quotes)
-                 match_nested_section = self.SECTION_RE.match(line)
-                 if match_nested_section:
+                match_nested_section = self.SECTION_RE.match(line)
+                if match_nested_section:
                      nested_section_name = match_nested_section.group(1).strip().replace('"', '')
-                 else:
-                     print(f"Warning [Line {self.i+1}]: Could not properly extract nested section name from: {line}", file=sys.stderr)
-                     nested_section_name = line.split(None, 1)[1].strip()
+                     nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+                     
+                     # Advance past 'config' line temporarily for peeking
+                     self.i += 1 
+                     peek_i = self.i; is_nested_list = False
+                     while peek_i < len(self.lines):
+                         peek_line = self.lines[peek_i].strip(); peek_i += 1
+                         if not peek_line or peek_line.startswith('#'): continue
+                         if self.EDIT_RE.match(peek_line): is_nested_list = True
+                         break
+                     # Reset self.i back to the 'config' line
+                     self.i = original_line_index 
 
-                 nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+                     new_context_type = 'nested_list' if is_nested_list else 'nested_settings'
+                     new_nested_data = [] if is_nested_list else {}
+                     
+                     # Store the nested structure in the parent context BEFORE pushing stack
+                     if isinstance(target_dict_for_set, dict):
+                          # Handle multiple nested blocks with same name
+                          if nested_key in target_dict_for_set:
+                               if not isinstance(target_dict_for_set[nested_key], list):
+                                    target_dict_for_set[nested_key] = [target_dict_for_set[nested_key]]
+                               target_dict_for_set[nested_key].append(new_nested_data)
+                               # Problem: Which list/dict instance do we push to stack? The new one.
+                               data_to_push = new_nested_data 
+                          else:
+                              target_dict_for_set[nested_key] = new_nested_data
+                              data_to_push = new_nested_data
+                     elif context_type == 'nested_list' and isinstance(current_context['data'], list):
+                           # If the parent is a list, the nested config belongs to the current_item within that list
+                           parent_item = current_context.get('current_item')
+                           if isinstance(parent_item, dict):
+                               if nested_key in parent_item: # Handle duplicates
+                                    if not isinstance(parent_item[nested_key], list): parent_item[nested_key] = [parent_item[nested_key]]
+                                    parent_item[nested_key].append(new_nested_data)
+                               else: parent_item[nested_key] = new_nested_data
+                               data_to_push = new_nested_data
+                           else:
+                               print(f"Warning [Line {original_line_index+1}]: Nested block '{nested_key}' found in list context, but no current item dictionary. Skipping.", file=sys.stderr)
+                               self.i += 1; continue # Skip 'config' line
+                     else:
+                          # Adding nested block to unexpected parent type
+                          print(f"Warning [Line {original_line_index+1}]: Trying to add nested block '{nested_key}' to non-dict parent context: {type(target_dict_for_set)}. Skipping nested block.", file=sys.stderr)
+                          self.i += 1; continue # Skip 'config' line
 
-                 # Determine if nested block is list or settings
-                 peek_i = self.i + 1
-                 is_list_block = False
-                 while peek_i < len(self.lines):
-                     peek_line = self.lines[peek_i].strip()
-                     if not peek_line or peek_line.startswith('#'):
-                         peek_i += 1
-                         continue
-                     if self.EDIT_RE.match(peek_line):
-                         is_list_block = True
-                     break
-
-                 # Recursively read the nested block
-                 if is_list_block:
-                      nested_data = self._read_block()
-                 else:
-                      nested_data = self._read_settings()
-
-                 nesting_level -= 1 # Decrement after the recursive call returns
-
-                 # Store nested data under the normalized key
-                 settings[nested_key] = nested_data
-
-                 # Continue to the next line after the nested block
-                 continue
-
-            # --- Match Standard Commands ---
-            m_set = self.SET_RE.match(line)
-            m_append = self.APPEND_RE.match(line) # ADDED APPEND
-            m_unset = self.UNSET_RE.match(line)   # ADDED UNSET
-            m_end = self.END_RE.match(line)
-
-            if m_set:
-                key = m_set.group(1).replace('-', '_') # Normalize key
-                raw_val = m_set.group(2).strip()     # Get the raw value part
-
-                # --- Robust Value Parsing (same logic as _read_block) ---
-                if raw_val.startswith('"') and raw_val.endswith('"'):
-                    val = raw_val[1:-1]
-                elif ' ' in raw_val:
-                    split_vals = []
-                    current_val = ''
-                    in_quotes = False
-                    for char in raw_val:
-                        if char == '"':
-                            in_quotes = not in_quotes
-                        elif char == ' ' and not in_quotes:
-                            if current_val:
-                                split_vals.append(current_val)
-                            current_val = ''
-                        else:
-                            current_val += char
-                    if current_val:
-                        split_vals.append(current_val)
-
-                    if key in ['ip', 'subnet'] and len(split_vals) == 2:
-                        ip_part = split_vals[0]
-                        mask_part = split_vals[1]
-                        try:
-                            prefix = self._mask_to_prefix(mask_part)
-                            if prefix is not None:
-                                ipaddress.ip_address(ip_part)
-                                val = f"{ip_part}/{prefix}"
-                            else:
-                                val = f"{ip_part}/{mask_part}"
-                        except ValueError:
-                            print(f"Warning [Line {self.i+1}]: Invalid IP/mask format '{ip_part} {mask_part}' for key '{key}'. Storing as is.", file=sys.stderr)
-                            val = f"{ip_part}/{mask_part}"
-                    elif len(split_vals) > 1:
-                        val = split_vals
-                    else:
-                        val = raw_val
+                     # Push new context onto stack
+                     new_context = {'type': new_context_type, 'data': data_to_push}
+                     if is_nested_list: new_context['current_item'] = None # Init list item tracker
+                     stack.append(new_context) 
+                     if self.debug: print(f"       -> PUSH stack (nested config '{nested_key}', type {new_context_type}). New depth: {len(stack)}")
+                     self.i += 1 # Consume 'config ...' line
+                     continue # Process next line with the new context
                 else:
-                    val = raw_val
+                     print(f"Warning [Line {original_line_index+1}]: Malformed nested config line: {line}. Attempting to skip.", file=sys.stderr)
+                     self.i += 1; continue
 
-                settings[key] = val
-                if self.debug: print(f"       -> Stored set: {key} = {val}") # DEBUG
+            # Handle 'edit' command (Only valid in list contexts)
+            m_edit = self.EDIT_RE.match(line)
+            if m_edit:
+                if context_type in ['list_item', 'nested_list']:
+                     # Finalize the previous item being built in this list context
+                     list_to_append_to = current_context['data'] # The actual list object
+                     item_being_built = current_context.get('current_item')
+                     if item_being_built is not None and isinstance(list_to_append_to, list):
+                          list_to_append_to.append(item_being_built)
 
-            elif m_append:
-                 key = m_append.group(1).replace('-', '_')
-                 raw_val = m_append.group(2).strip()
-                 if raw_val.startswith('"') and raw_val.endswith('"'):
-                     append_val = raw_val[1:-1]
+                     # Start the new item
+                     edit_val = m_edit.group(1) or m_edit.group(2)
+                     id_key = 'id' if edit_val.isdigit() else 'name'
+                     new_item = {id_key: edit_val}
+                     # Update the stack context for the *current* list level
+                     stack[-1]['current_item'] = new_item 
+                     if self.debug: print(f"       -> Started new item: {new_item}")
+                else:
+                     print(f"Warning [Line {original_line_index+1}]: 'edit' command found in non-list context ('{context_type}'). Skipping line.", file=sys.stderr)
+                self.i += 1; continue
+
+            # Handle 'set' command
+            m_set = self.SET_RE.match(line)
+            if m_set:
+                if isinstance(target_dict_for_set, dict):
+                    key = m_set.group(1).replace('-', '_')
+                    raw_val = m_set.group(2).strip()
+                    val = self._parse_set_value(key, raw_val, original_line_index + 1) # Use helper
+                    target_dict_for_set[key] = val
+                    if self.debug: print(f"       -> Stored set in {context_type}: {key} = {val}")
+                else:
+                     context_id_str = "N/A"
+                     if target_dict_for_set: context_id_str = target_dict_for_set.get('id', target_dict_for_set.get('name', '...'))
+                     print(f"Warning [Line {original_line_index + 1}]: 'set' command encountered but no valid current item/dictionary in context ('{context_type}', item '{context_id_str}'). Skipping line.", file=sys.stderr)
+                self.i += 1; continue
+
+            # Handle 'append' command
+            m_append = self.APPEND_RE.match(line)
+            if m_append:
+                if isinstance(target_dict_for_set, dict):
+                     key = m_append.group(1).replace('-', '_'); raw_val = m_append.group(2).strip()
+                     if raw_val.startswith('"') and raw_val.endswith('"'): append_val = raw_val[1:-1]
+                     else: append_val = raw_val
+                     if key not in target_dict_for_set: target_dict_for_set[key] = []
+                     elif not isinstance(target_dict_for_set[key], list): target_dict_for_set[key] = [target_dict_for_set[key]]
+                     target_dict_for_set[key].append(append_val)
+                     if self.debug: print(f"       -> Handled append for key '{key}', value '{append_val}'")
+                else:
+                     print(f"Warning [Line {original_line_index+1}]: 'append' command encountered but no valid current item/dictionary in context ('{context_type}'). Skipping line.", file=sys.stderr)
+                self.i += 1; continue
+
+            # Handle 'unset' command
+            m_unset = self.UNSET_RE.match(line)
+            if m_unset:
+                 if isinstance(target_dict_for_set, dict):
+                     key = m_unset.group(1).replace('-', '_')
+                     if key in target_dict_for_set: del target_dict_for_set[key]
+                     if self.debug: print(f"       -> Handled unset for key '{key}'")
                  else:
-                     append_val = raw_val
+                     print(f"Warning [Line {original_line_index+1}]: 'unset' command encountered but no valid current item/dictionary in context ('{context_type}'). Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
 
-                 if key not in settings:
-                     settings[key] = []
-                 elif not isinstance(settings[key], list):
-                     settings[key] = [settings[key]]
-                 settings[key].append(append_val)
-                 if self.debug: print(f"       -> Handled append for key '{key}', value '{append_val}'") # DEBUG
+            # Handle 'next' command (Only valid in list contexts)
+            m_next = self.NEXT_RE.match(line)
+            if m_next:
+                 if context_type in ['list_item', 'nested_list']:
+                     # Finalize the current item and add it to the list in the context data
+                     list_to_append_to = current_context.get('data')
+                     item_being_built = current_context.get('current_item')
+                     if item_being_built is not None and isinstance(list_to_append_to, list):
+                         list_to_append_to.append(item_being_built)
+                         stack[-1]['current_item'] = None # Reset item for the next 'edit'
+                         if self.debug: print(f"       -> Handled 'next', finalized item.")
+                     else:
+                         if self.debug: print(f"       -> Handled 'next', no current item to finalize or parent not list.")
+                 else:
+                     print(f"Warning [Line {original_line_index+1}]: 'next' command found in non-list context ('{context_type}'). Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
 
-            elif m_unset:
-                 key = m_unset.group(1).replace('-', '_')
-                 if key in settings:
-                     del settings[key]
-                 if self.debug: print(f"       -> Handled unset for key '{key}'") # DEBUG
+            # Handle 'end' command
+            m_end = self.END_RE.match(line)
+            if m_end:
+                # Finalize the last item if we are ending a list context
+                if context_type in ['list_item', 'nested_list']:
+                     list_to_append_to = current_context.get('data')
+                     item_being_built = current_context.get('current_item')
+                     if item_being_built is not None and isinstance(list_to_append_to, list):
+                         list_to_append_to.append(item_being_built)
+                         if self.debug: print(f"       -> Finalized last item before 'end'.")
 
-            elif m_end:
-                 nesting_level -= 1
-                 if nesting_level == 0:
+                # Pop context from stack
+                stack.pop()
+                if self.debug: print(f"       -> POP stack (found end). New depth: {len(stack)}")
+
+                if not stack:
+                     # Popped the last context, we're done with this block
                      self.i += 1 # Consume 'end'
-                     if self.debug: print(f" << Exit _read_settings (found end) @ L{self.i}, Final Level {nesting_level}") # DEBUG
-                     return settings # Return the dictionary of settings
+                     if self.debug: print(f" << Exit _read_block_iterative (found final end) @ L{self.i}") # DEBUG
+                     # The top-level 'data' in the initial context was the 'items' list itself
+                     return items 
+                else:
+                     # Still inside nested blocks
+                     self.i += 1 # Consume 'end'
+                     continue
+                
+            # Handle comments and empty lines
+            if not line or line.startswith('#'):
+                self.i += 1; continue
+
+            # Handle unexpected lines
+            print(f"Warning [Line {original_line_index + 1}]: Skipping unexpected line inside iterative block reader: {line}", file=sys.stderr)
+            self.i += 1
+
+        # --- End of loop (EOF reached before final 'end') ---
+        if stack:
+             print(f"Warning: Reached end of file while reading block iteratively. Stack depth: {len(stack)}. Block started near {block_start_line_index+1}", file=sys.stderr)
+             # Attempt to finalize the very last item if necessary
+             if len(stack) == 1 and stack[0]['type'] == 'list_item':
+                 final_context = stack[0]
+                 item_being_built = final_context.get('current_item')
+                 if item_being_built is not None:
+                      items.append(item_being_built)
+
+        if self.debug: print(f" << Exit _read_block_iterative (EOF) @ L{self.i}") # DEBUG
+        return items
+
+    def _read_settings_iterative(self, block_start_line_index):
+        """Iteratively read a block of settings for a single-item config section."""
+        if self.debug: print(f" >> Enter _read_settings_iterative @ L{block_start_line_index + 1}") # DEBUG
+
+        top_level_settings = {}
+        # Stack stores dictionaries: {'type': 'settings'/'nested_list'/'nested_settings', 'data': dict/list, 'current_item': dict/None}
+        stack = [{'type': 'settings', 'data': top_level_settings}] 
+        self.i = block_start_line_index # Ensure parser is at the start
+
+        while self.i < len(self.lines):
+            line = self.lines[self.i].strip()
+            original_line_index = self.i
+            
+            if not stack: # Should not happen
+                 print(f"ERROR: Parser stack empty during iterative settings read near line {original_line_index+1}. Aborting block.", file=sys.stderr)
+                 return top_level_settings
+
+            current_context = stack[-1]
+            context_type = current_context['type']
+            # Target dictionary for 'set'/'append'/'unset' depends on context
+            target_dict_for_set = None
+            if context_type in ['settings', 'nested_settings']:
+                 target_dict_for_set = current_context.get('data')
+            elif context_type == 'nested_list':
+                 target_dict_for_set = current_context.get('current_item')
+
+            if self.debug: print(f"    [L{self.i+1}, StackLvl {len(stack)}] Iter Ctx: {context_type} | Read: {line}") # DEBUG
+
+            # Handle nested config blocks
+            if line.startswith('config '):
+                match_nested_section = self.SECTION_RE.match(line)
+                if match_nested_section:
+                     nested_section_name = match_nested_section.group(1).strip().replace('"', '')
+                     nested_key = nested_section_name.lower().replace(' ','_').replace('-','_')
+                     
+                     # Advance past 'config' line temporarily for peeking
+                     self.i += 1 
+                     peek_i = self.i; is_nested_list = False
+                     while peek_i < len(self.lines):
+                         peek_line = self.lines[peek_i].strip(); peek_i += 1
+                         if not peek_line or peek_line.startswith('#'): continue
+                         if self.EDIT_RE.match(peek_line): is_nested_list = True
+                         break
+                     self.i = original_line_index # Reset self.i
+
+                     new_context_type = 'nested_list' if is_nested_list else 'nested_settings'
+                     new_nested_data = [] if is_nested_list else {}
+                     
+                     # Store nested data in the parent dictionary context
+                     if isinstance(target_dict_for_set, dict):
+                          if nested_key in target_dict_for_set: # Handle duplicates
+                               if not isinstance(target_dict_for_set[nested_key], list): target_dict_for_set[nested_key] = [target_dict_for_set[nested_key]]
+                               target_dict_for_set[nested_key].append(new_nested_data)
+                               data_to_push = new_nested_data # Push the new instance
+                          else:
+                              target_dict_for_set[nested_key] = new_nested_data
+                              data_to_push = new_nested_data
+                     elif context_type == 'nested_list' and isinstance(current_context['data'], list):
+                           # Nested config inside a list item within settings
+                           parent_item = current_context.get('current_item')
+                           if isinstance(parent_item, dict):
+                               if nested_key in parent_item: # Handle duplicates
+                                    if not isinstance(parent_item[nested_key], list): parent_item[nested_key] = [parent_item[nested_key]]
+                                    parent_item[nested_key].append(new_nested_data)
+                               else: parent_item[nested_key] = new_nested_data
+                               data_to_push = new_nested_data
+                           else:
+                               print(f"Warning [Line {original_line_index+1}]: Nested block '{nested_key}' found in list context, but no current item dictionary. Skipping.", file=sys.stderr)
+                               self.i += 1; continue # Skip 'config' line
+                     else: 
+                          print(f"Warning [Line {original_line_index+1}]: Trying to add nested block '{nested_key}' to non-dict parent context: {type(target_dict_for_set)} in settings block. Skipping nested block.", file=sys.stderr)
+                          self.i += 1; continue # Skip 'config' line
+
+                     # Push new context
+                     new_context = {'type': new_context_type, 'data': data_to_push}
+                     if is_nested_list: new_context['current_item'] = None
+                     stack.append(new_context)
+                     if self.debug: print(f"       -> PUSH stack (nested config '{nested_key}', type {new_context_type}). New depth: {len(stack)}")
+                     self.i += 1; continue # Consume 'config' line
+                else:
+                     print(f"Warning [Line {original_line_index+1}]: Malformed nested config line: {line}. Attempting to skip.", file=sys.stderr)
+                     self.i += 1; continue
+
+            # Handle 'edit' (Only valid if inside a 'nested_list' context)
+            m_edit = self.EDIT_RE.match(line)
+            if m_edit:
+                 if context_type == 'nested_list':
+                     list_to_append_to = current_context['data']
+                     item_being_built = current_context.get('current_item')
+                     if item_being_built is not None and isinstance(list_to_append_to, list):
+                          list_to_append_to.append(item_being_built)
+                     
+                     edit_val = m_edit.group(1) or m_edit.group(2)
+                     id_key = 'id' if edit_val.isdigit() else 'name'
+                     new_item = {id_key: edit_val}
+                     stack[-1]['current_item'] = new_item # Store item being built in list context
+                     if self.debug: print(f"       -> Started new item in nested list: {new_item}")
                  else:
-                     # This 'end' closes a nested block.
-                     pass
-            elif not line or line.startswith('#'):
-                 pass # Skip comments and empty lines
-            # --- ADDED: Handle unexpected lines ---
-            else:
-                 print(f"Warning [Line {self.i+1}]: Skipping unexpected line inside settings block: {line}", file=sys.stderr)
+                     print(f"Warning [Line {original_line_index+1}]: 'edit' command found in non-list context ('{context_type}') within settings block. Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
 
-            self.i += 1 # Move to the next line
+            # Handle 'set' command
+            m_set = self.SET_RE.match(line)
+            if m_set:
+                 if isinstance(target_dict_for_set, dict):
+                     key = m_set.group(1).replace('-', '_')
+                     raw_val = m_set.group(2).strip()
+                     val = self._parse_set_value(key, raw_val, original_line_index + 1)
+                     target_dict_for_set[key] = val
+                     if self.debug: print(f"       -> Stored set in {context_type}: {key} = {val}")
+                 else:
+                     print(f"Warning [Line {original_line_index + 1}]: 'set' command encountered but no valid current dictionary in context ('{context_type}'). Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
 
-        # End of loop (likely reached EOF)
-        print(f"Warning: Reached end of file while reading settings (nesting level {nesting_level}).", file=sys.stderr)
-        if self.debug: print(f" << Exit _read_settings (EOF) @ L{self.i}, Final Level {nesting_level}") # DEBUG
-        return settings
+            # Handle 'append' command
+            m_append = self.APPEND_RE.match(line)
+            if m_append:
+                 if isinstance(target_dict_for_set, dict):
+                     key = m_append.group(1).replace('-', '_'); raw_val = m_append.group(2).strip()
+                     if raw_val.startswith('"') and raw_val.endswith('"'): append_val = raw_val[1:-1]
+                     else: append_val = raw_val
+                     if key not in target_dict_for_set: target_dict_for_set[key] = []
+                     elif not isinstance(target_dict_for_set[key], list): target_dict_for_set[key] = [target_dict_for_set[key]]
+                     target_dict_for_set[key].append(append_val)
+                     if self.debug: print(f"       -> Handled append for key '{key}', value '{append_val}'")
+                 else:
+                     print(f"Warning [Line {original_line_index+1}]: 'append' command encountered but no valid dictionary in context ('{context_type}'). Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
+
+            # Handle 'unset' command
+            m_unset = self.UNSET_RE.match(line)
+            if m_unset:
+                 if isinstance(target_dict_for_set, dict):
+                     key = m_unset.group(1).replace('-', '_')
+                     if key in target_dict_for_set: del target_dict_for_set[key]
+                     if self.debug: print(f"       -> Handled unset for key '{key}'")
+                 else:
+                     print(f"Warning [Line {original_line_index+1}]: 'unset' command encountered but no valid dictionary in context ('{context_type}'). Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
+
+            # Handle 'next' command (Only valid in 'nested_list' context)
+            m_next = self.NEXT_RE.match(line)
+            if m_next:
+                 if context_type == 'nested_list':
+                     list_to_append_to = current_context.get('data')
+                     item_being_built = current_context.get('current_item')
+                     if item_being_built is not None and isinstance(list_to_append_to, list):
+                         list_to_append_to.append(item_being_built)
+                         stack[-1]['current_item'] = None # Reset item for next 'edit'
+                         if self.debug: print(f"       -> Handled 'next' in nested list.")
+                     else:
+                          if self.debug: print(f"       -> Handled 'next', no current item to finalize or parent not list.")
+                 else:
+                     print(f"Warning [Line {original_line_index+1}]: 'next' command found in non-list context ('{context_type}') within settings. Skipping line.", file=sys.stderr)
+                 self.i += 1; continue
+
+            # Handle 'end' command
+            m_end = self.END_RE.match(line)
+            if m_end:
+                # Finalize the last item if we are ending a nested list context
+                if context_type == 'nested_list':
+                     list_to_append_to = current_context.get('data')
+                     item_being_built = current_context.get('current_item')
+                     if item_being_built is not None and isinstance(list_to_append_to, list):
+                         list_to_append_to.append(item_being_built)
+                         if self.debug: print(f"       -> Finalized last item in nested list before 'end'.")
+
+                stack.pop()
+                if self.debug: print(f"       -> POP stack (found end). New depth: {len(stack)}")
+
+                if not stack:
+                     self.i += 1 # Consume final 'end'
+                     if self.debug: print(f" << Exit _read_settings_iterative (found final end) @ L{self.i}") # DEBUG
+                     return top_level_settings
+                else:
+                     self.i += 1 # Consume 'end'
+                     continue
+
+            # Handle comments/empty lines
+            if not line or line.startswith('#'):
+                self.i += 1; continue
+
+            # Handle unexpected lines
+            print(f"Warning [Line {original_line_index + 1}]: Skipping unexpected line inside iterative settings reader: {line}", file=sys.stderr)
+            self.i += 1
+
+        # --- End of loop (EOF) ---
+        if stack:
+             print(f"Warning: Reached end of file while reading settings iteratively. Stack depth: {len(stack)}. Block started near {block_start_line_index+1}", file=sys.stderr)
+             # No item finalization needed here as the top level is a dict
+
+        if self.debug: print(f" << Exit _read_settings_iterative (EOF) @ L{self.i}") # DEBUG
+        return top_level_settings
 
     # --- Specific Section Handlers --- 
     # These methods parse specific 'config ...' sections.
     # They typically call _read_block() or _read_settings() and store the result
     # in the appropriate attribute of the self.model or VDOM sub-model.
+    # **IMPORTANT**: These handlers should now be called AFTER the main loop
+    # has consumed the 'config ...' line that identifies the section.
 
     def _get_target_model(self):
          """Returns the correct model (main or VDOM) based on current_vdom."""
@@ -736,28 +1102,37 @@ class FortiParser:
              
     def _handle_router_static(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         processed_routes = []
         for idx, item in enumerate(items):
-             item['name'] = item.get('seq_num', f'static_route_{idx+1}')
+             # Ensure item is a dictionary before processing
+             if not isinstance(item, dict):
+                  print(f"Warning [Handler:router_static]: Expected dict for route item, got {type(item)}. Skipping.", file=sys.stderr)
+                  continue
+                  
+             # Use seq_num if present, otherwise generate name
+             item['name'] = item.get('seq_num', f'static_route_{idx+1}') 
              
-             # --- FIX START: Convert dst list [ip, mask] to ip/prefix string ---
+             # --- Convert dst list [ip, mask] to ip/prefix string ---
              dst_val = item.get('dst')
              if isinstance(dst_val, list) and len(dst_val) == 2:
                  ip_part = dst_val[0]
                  mask_part = dst_val[1]
                  prefix = self._mask_to_prefix(mask_part)
                  if prefix is not None:
-                     item['dst'] = f"{ip_part}/{prefix}"
+                     try:
+                         ipaddress.ip_address(ip_part) # Validate IP
+                         item['dst'] = f"{ip_part}/{prefix}"
+                     except ValueError:
+                          print(f"Warning [Handler:router_static]: Invalid IP '{ip_part}' in route destination '{item['name']}'. Storing as ip/mask.", file=sys.stderr)
+                          item['dst'] = f"{ip_part}/{mask_part}" 
                  else:
                      # Fallback to ip/mask if prefix conversion failed
                      item['dst'] = f"{ip_part}/{mask_part}" 
-                     print(f"Warning: Storing route destination '{item['name']}' as ip/mask due to mask parse failure.", file=sys.stderr)
+                     # Warning printed in _mask_to_prefix
              elif isinstance(dst_val, list): # Unexpected list format
-                 print(f"Warning: Unexpected list format for destination in route '{item['name']}': {dst_val}. Storing as is.", file=sys.stderr)
-                 # Keep original list if format is wrong
+                 print(f"Warning [Handler:router_static]: Unexpected list format for destination in route '{item['name']}': {dst_val}. Storing as is.", file=sys.stderr)
              # else: dst_val is already a string or None, leave it as is
-             # --- FIX END ---
              
              processed_routes.append(item) # Add the potentially modified item
              
@@ -765,405 +1140,568 @@ class FortiParser:
 
     def _handle_firewall_address(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:firewall_address]: Expected dict for address item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue # Skip non-dict items
             name = item.get('name')
             if name:
-                if item.get('type') == 'fqdn':
-                     item['subnet'] = item.get('fqdn', item.get('name'))
-                elif item.get('type') == 'wildcard':
-                     item['subnet'] = item.get('wildcard', '?/?')
-                     
+                # Normalize address types
+                addr_type = item.get('type', 'ipmask') # Default type? Check FortiOS defaults
+                if addr_type == 'ipmask' and 'subnet' in item:
+                    pass # Already handled by _parse_set_value likely
+                elif addr_type == 'fqdn':
+                     item['subnet'] = item.get('fqdn', item.get('name')) # Store FQDN in subnet field for consistency?
+                elif addr_type == 'wildcard':
+                     # Store wildcard address - needs specific handling later
+                     item['subnet'] = item.get('wildcard', '?/?') 
+                elif addr_type == 'iprange':
+                     item['subnet'] = f"{item.get('start_ip','?')}-{item.get('end_ip','?')}" # Combine range
+                elif addr_type == 'geography':
+                     item['subnet'] = f"geo:{item.get('country', '?')}" # Store geography info
+                elif addr_type == 'interface-subnet':
+                     item['subnet'] = f"if-subnet:{item.get('subnet', name)}" # Reference to interface subnet
+
                 target_model.addresses[name] = item
             else:
-                 print(f"Warning: Firewall address item found without name at line ~{self.i}. Skipping.", file=sys.stderr)
+                 print(f"Warning [Handler:firewall_address]: Address item found without name near line ~{self.i}. Skipping.", file=sys.stderr)
                  
     def _handle_firewall_addrgrp(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:firewall_addrgrp]: Expected dict for addrgrp item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             members = item.get('member', [])
             if name:
+                # Ensure members is always a list
                 target_model.addr_groups[name] = members if isinstance(members, list) else [members]
+            else:
+                 print(f"Warning [Handler:firewall_addrgrp]: Address group found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_firewall_service_custom(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:service_custom]: Expected dict for service item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                protocol = item.get('protocol', 'TCP/UDP/SCTP')
-                port_key = None
-                if protocol == 'TCP/UDP/SCTP':
-                     port_key = 'tcp_portrange'
-                     if 'udp_portrange' in item: port_key = 'udp_portrange'
-                elif protocol == 'ICMP' or protocol == 'ICMP6':
-                     item['port'] = f"type:{item.get('icmptype', 'any')}/code:{item.get('icmpcode', 'any')}"
-                     item['protocol'] = protocol.upper()
+                protocol = item.get('protocol', 'TCP/UDP/SCTP') # Default protocol
+                # Combine port ranges into a single 'port' field for simplicity
+                port_info = []
+                if 'tcp_portrange' in item: port_info.append(f"TCP:{item['tcp_portrange']}")
+                if 'udp_portrange' in item: port_info.append(f"UDP:{item['udp_portrange']}")
+                if 'sctp_portrange' in item: port_info.append(f"SCTP:{item['sctp_portrange']}")
+                
+                if protocol == 'ICMP' or protocol == 'ICMP6':
+                     icmp_type = item.get('icmptype', 'any')
+                     icmp_code = item.get('icmpcode', 'any') if icmp_type != 'any' else 'any'
+                     port_info.append(f"Type:{icmp_type}" + (f"/Code:{icmp_code}" if icmp_code != 'any' else ""))
+                     item['protocol'] = protocol.upper() # Ensure consistent case
                 elif protocol == 'IP':
-                     item['port'] = 'any'
+                     port_info.append(f"ProtoNum:{item.get('protocol_number','any')}")
                      item['protocol'] = 'IP'
+                elif protocol == 'TCP/UDP/SCTP':
+                    # Handled by tcp/udp/sctp_portrange above
+                    pass
                 else:
-                     port_key = f"{protocol.lower()}_portrange"
-                
-                if port_key and port_key in item:
-                    port_val = item.get(port_key)
-                    item['port'] = ' '.join(port_val) if isinstance(port_val, list) else port_val
-                elif protocol not in ['ICMP', 'ICMP6', 'IP']:
-                     item['port'] = item.get('port', 'any')
-                
-                if protocol == 'TCP/UDP/SCTP': item['protocol'] = 'TCP/UDP/SCTP'
-                elif protocol: item['protocol'] = protocol.upper()
+                     # Fallback for less common protocols
+                     port_info.append(f"{protocol}:{item.get(f'{protocol.lower()}_portrange', 'any')}")
+                     
+                item['port'] = ', '.join(port_info) if port_info else 'any'
                      
                 target_model.services[name] = item
+            else:
+                 print(f"Warning [Handler:service_custom]: Custom service found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_firewall_service_group(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:service_group]: Expected dict for svcgrp item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             members = item.get('member', [])
             if name:
                 target_model.svc_groups[name] = members if isinstance(members, list) else [members]
+            else:
+                 print(f"Warning [Handler:service_group]: Service group found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_firewall_policy(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         multi_value_keys = ['srcintf', 'dstintf', 'srcaddr', 'dstaddr', 'service']
         for item in items:
-            item['id'] = item.get('policyid', item.get('id'))
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:firewall_policy]: Expected dict for policy item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
+            # Use 'policyid' if present, fall back to 'id' (less common)
+            item['id'] = item.get('policyid', item.get('id')) 
             if not item.get('id'): 
-                print(f"Warning: Policy found without ID near line {self.i}. Skipping.", file=sys.stderr)
+                print(f"Warning [Handler:firewall_policy]: Policy found without ID (policyid) near line {self.i}. Skipping.", file=sys.stderr)
                 continue
                 
+            # Ensure multi-value fields are lists
             for key in multi_value_keys:
-                 if key in item and not isinstance(item[key], list):
-                     item[key] = [item[key]]
-            item['comments'] = item.get('comments', '')
+                 # Use get to avoid KeyError if key is missing
+                 current_val = item.get(key)
+                 if current_val is not None and not isinstance(current_val, list):
+                     item[key] = [current_val]
+                 elif current_val is None: # Ensure key exists even if empty
+                      item[key] = [] 
+                      
+            item['comments'] = item.get('comments', '') # Ensure comments field exists
             target_model.policies.append(item)
             
-    _handle_firewall_policy6 = _handle_firewall_policy 
+    _handle_firewall_policy6 = _handle_firewall_policy # Alias for IPv6 policies
 
     def _handle_system_interface(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:system_interface]: Expected dict for interface item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                 secondary_ips = item.get('secondaryip', [])
-                 if secondary_ips and not isinstance(secondary_ips, list):
-                      print(f"Warning: Unexpected format for secondaryip in interface '{name}'. Expected list.", file=sys.stderr)
-                      item['secondary_ip'] = []
-                 elif secondary_ips:
-                      item['secondary_ip'] = secondary_ips
-                 else:
-                      item['secondary_ip'] = []
+                 # Handle secondary IPs (might be nested block or simple list?)
+                 # Assuming _read_block handles nested 'secondaryip' correctly
+                 secondary_ips_raw = item.get('secondaryip', [])
+                 item['secondary_ip'] = []
+                 if isinstance(secondary_ips_raw, list):
+                     # If it's a list of dicts (from nested config)
+                     if all(isinstance(sip, dict) for sip in secondary_ips_raw):
+                          item['secondary_ip'] = [sip.get('ip','?') for sip in secondary_ips_raw]
+                     # If it's already a list of strings (from simple set/append?)
+                     elif all(isinstance(sip, str) for sip in secondary_ips_raw):
+                          item['secondary_ip'] = secondary_ips_raw
+                 elif isinstance(secondary_ips_raw, dict): # Single nested item
+                      item['secondary_ip'] = [secondary_ips_raw.get('ip','?')]
                  
-                 # --- START ADDITION: Capture description --- 
-                 item['description'] = item.get('description', '') # Store description, default to empty string
-                 # --- END ADDITION ---
+                 # Ensure description exists
+                 item['description'] = item.get('description', '') 
                       
                  target_model.interfaces[name] = item
+            else:
+                 print(f"Warning [Handler:system_interface]: System interface found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
-    def _handle_system_vlan(self): 
-        target_model = self._get_target_model()
-        items = self._read_block()
-        print("Warning: Parsing 'config system vlan'. Structure might need adjustment.")
-        for item in items:
-             name = item.get('name')
-             if name:
-                 item['type'] = item.get('type', 'vlan')
-                 target_model.interfaces[name] = item 
+    # Example handler for VLANs if they are under 'system vlan'
+    def _handle_system_vlan_interface(self): 
+        # This might be needed if 'config system vlan-interface' exists
+        print("Info: Parsing 'config system vlan-interface'. Treating as regular interfaces.", file=sys.stderr)
+        self._handle_system_interface() # Reuse interface logic
 
     def _handle_switch_controller_managed_switch(self):
-        print("Warning: Skipping complex section 'switch-controller managed-switch'. Parsing not fully implemented.")
-        self._skip_block()
+        print("Warning: Skipping complex section 'switch-controller managed-switch'. Parsing not fully implemented.", file=sys.stderr)
+        # Need robust skipping if not parsing
+        self.i = self.current_block_start_index # Reset to start of block content
+        self._skip_to_next_block_or_end() # Use recovery skip
 
     def _handle_switch_controller_vlan(self): 
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:switch_vlan]: Expected dict for switch vlan item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                 members = item.get('member', [])
-                 item['members'] = [m.get('interface_name','?') for m in members] if isinstance(members, list) else []
-                 target_model.vlans[name] = item
+                 members_raw = item.get('member', []) # Might be nested block
+                 item['members'] = []
+                 if isinstance(members_raw, list):
+                     item['members'] = [m.get('interface_name','?') for m in members_raw if isinstance(m, dict)]
+                 elif isinstance(members_raw, dict): # Single member
+                      item['members'] = [members_raw.get('interface_name','?')]
+                      
+                 target_model.vlans[name] = item # Store under 'vlans' model attribute
+            else:
+                print(f"Warning [Handler:switch_vlan]: Switch controller VLAN found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_system_zone(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:system_zone]: Expected dict for zone item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             interfaces = item.get('interface', [])
             if name:
+                # Ensure 'interface' is a list
                 item['interface'] = interfaces if isinstance(interfaces, list) else [interfaces]
                 target_model.zones[name] = item
+            else:
+                print(f"Warning [Handler:system_zone]: System zone found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_firewall_vip(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:firewall_vip]: Expected dict for VIP item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                mapped_ips = item.get('mappedip', [])
-                if mapped_ips and not isinstance(mapped_ips, list):
-                     print(f"Warning: Unexpected format for mappedip in VIP '{name}'. Expected list.", file=sys.stderr)
-                     item['mappedip'] = []
-                elif not mapped_ips:
-                     item['mappedip'] = []
+                # Handle mapped IPs (might be nested block)
+                mapped_ips_raw = item.get('mappedip', [])
+                item['mappedip_parsed'] = [] # Store parsed IPs here
+                if isinstance(mapped_ips_raw, list):
+                     if all(isinstance(mip, dict) for mip in mapped_ips_raw):
+                          item['mappedip_parsed'] = [mip.get('range','?') for mip in mapped_ips_raw]
+                     elif all(isinstance(mip, str) for mip in mapped_ips_raw): # Simple list? Unlikely
+                           item['mappedip_parsed'] = mapped_ips_raw 
+                elif isinstance(mapped_ips_raw, dict): # Single nested item
+                      item['mappedip_parsed'] = [mapped_ips_raw.get('range','?')]
+                      
                 target_model.vips[name] = item
+            else:
+                print(f"Warning [Handler:firewall_vip]: Firewall VIP found without name near line ~{self.i}. Skipping.", file=sys.stderr)
                 
-    _handle_firewall_vip6 = _handle_firewall_vip 
+    _handle_firewall_vip6 = _handle_firewall_vip # Alias for IPv6 VIPs
 
     def _handle_firewall_vipgrp(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:firewall_vipgrp]: Expected dict for VIP group item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             members = item.get('member', [])
             if name:
                 target_model.vip_groups[name] = members if isinstance(members, list) else [members]
+            else:
+                print(f"Warning [Handler:firewall_vipgrp]: VIP group found without name near line ~{self.i}. Skipping.", file=sys.stderr)
                 
-    _handle_firewall_vipgrp6 = _handle_firewall_vipgrp 
+    _handle_firewall_vipgrp6 = _handle_firewall_vipgrp # Alias for IPv6 VIP groups
 
     def _handle_firewall_ippool(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:firewall_ippool]: Expected dict for IP Pool item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
                 target_model.ippools[name] = item
+            else:
+                print(f"Warning [Handler:firewall_ippool]: IP Pool found without name near line ~{self.i}. Skipping.", file=sys.stderr)
                 
-    _handle_firewall_ippool6 = _handle_firewall_ippool 
+    _handle_firewall_ippool6 = _handle_firewall_ippool # Alias for IPv6 IP Pools
 
     def _handle_system_dhcp_server(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:dhcp_server]: Expected dict for DHCP server item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('id') # DHCP servers use ID
+             if not item_id:
+                  print(f"Warning [Handler:dhcp_server]: DHCP Server found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
+                  continue
+                  
+             # Process IP range (usually a nested block 'config ip-range')
              ip_range_list = item.get('ip_range', [])
-             if ip_range_list and isinstance(ip_range_list, list):
-                 ip_range_data = ip_range_list[0] 
-                 item['ip_range_str'] = f"{ip_range_data.get('start_ip','?')} - {ip_range_data.get('end_ip','?')}"
-             else:
-                 item['ip_range_str'] = "Not Configured"
+             if isinstance(ip_range_list, list) and ip_range_list:
+                 ip_range_data = ip_range_list[0] # Assume only one range block per server ID
+                 if isinstance(ip_range_data, dict):
+                      item['ip_range_str'] = f"{ip_range_data.get('start_ip','?')} - {ip_range_data.get('end_ip','?')}"
+                 else: item['ip_range_str'] = "Invalid Range Data"
+             elif isinstance(ip_range_list, dict): # If parser returned single dict
+                  item['ip_range_str'] = f"{ip_range_list.get('start_ip','?')} - {ip_range_list.get('end_ip','?')}"
+             else: item['ip_range_str'] = "Not Configured"
                  
-             # Handle nested 'config reserved_address' block
+             # Handle nested 'config reserved-address' block
+             # _read_block should store this as a list of dicts in item['reserved_address']
              reserved_list = item.get('reserved_address', [])
-             item['reserved_addresses'] = reserved_list # Store the list of reserved dicts
+             item['reserved_addresses'] = reserved_list if isinstance(reserved_list, list) else [] # Ensure it's a list
                  
-             target_model.dhcp_servers.append(item)
+             target_model.dhcp_servers.append(item) # Store the whole item dict
 
     def _handle_router_ospf(self):
         target_model = self._get_target_model()
         # This is a settings block, not a list block
-        settings = self._read_settings()
-        target_model.ospf = settings
-        
-    # OSPF sub-sections are handled when _read_settings encounters them recursively
-    # Example nested handlers (called implicitly by recursion in _read_settings)
-    # def _handle_router_ospf_area(self):
-    #     # Called when 'config area' is found inside 'config router ospf'
-    #     # Returns list of area dictionaries
-    #     return self._read_block() 
-    # def _handle_router_ospf_network(self):
-    #     # Called for 'config network' inside ospf
-    #     return self._read_block()
-    # def _handle_router_ospf_interface(self):
-    #      # Called for 'config ospf-interface' inside ospf
-    #      return self._read_block()
+        settings = self._read_settings() # Use default iterative version
+        target_model.ospf = settings if isinstance(settings, dict) else {} # Ensure it's a dict
 
     def _handle_router_bgp(self):
         target_model = self._get_target_model()
-        settings = self._read_settings() # Reads the whole block including nested
+        settings = self._read_settings() # Use default iterative version
         
-        # Extract neighbors if present
-        if 'neighbor' in settings and isinstance(settings['neighbor'], list):
-            target_model.bgp_neighbors = settings.pop('neighbor') 
-        else:
-            target_model.bgp_neighbors = [] # Ensure it's an empty list if not found
+        if not isinstance(settings, dict):
+            print(f"Warning [Handler:router_bgp]: Expected dict for BGP settings, got {type(settings)}. Skipping BGP parse.", file=sys.stderr)
+            settings = {} # Assign empty dict to prevent errors
             
-        # Extract networks if present
-        if 'network' in settings and isinstance(settings['network'], list):
-            target_model.bgp_networks = settings.pop('network')
-        else:
-            target_model.bgp_networks = []
+        # Extract known nested list sections if they exist
+        target_model.bgp_neighbors = settings.pop('neighbor', []) if isinstance(settings.get('neighbor'), list) else []
+        target_model.bgp_networks = settings.pop('network', []) if isinstance(settings.get('network'), list) else []
+        # Add others like neighbor-group, neighbor-range etc. if needed
             
         # Store the remaining top-level BGP settings
         target_model.bgp = settings
 
-    # BGP sub-sections handled implicitly by _read_settings recursion
-    # def _handle_router_bgp_neighbor(self):
-
     def _handle_vpn_ipsec_phase1_interface(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:vpn_p1]: Expected dict for P1 item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
                 target_model.phase1[name] = item
+            else:
+                print(f"Warning [Handler:vpn_p1]: VPN Phase1 found without name near line ~{self.i}. Skipping.", file=sys.stderr)
                 
     _handle_vpn_ipsec_phase1 = _handle_vpn_ipsec_phase1_interface # Alias
 
     def _handle_vpn_ipsec_phase2_interface(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:vpn_p2]: Expected dict for P2 item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                # Resolve src/dst selectors if they refer to address objects
-                # This might be better done in a post-processing step or diagram generator
                 target_model.phase2[name] = item
+            else:
+                print(f"Warning [Handler:vpn_p2]: VPN Phase2 found without name near line ~{self.i}. Skipping.", file=sys.stderr)
                 
     _handle_vpn_ipsec_phase2 = _handle_vpn_ipsec_phase2_interface # Alias
 
     def _handle_firewall_shaper_traffic_shaper(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:traffic_shaper]: Expected dict for shaper item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
                 target_model.traffic_shapers[name] = item
 
     def _handle_firewall_shaper_per_ip_shaper(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:per_ip_shaper]: Expected dict for per-ip shaper item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
                 target_model.shaper_per_ip[name] = item
 
     def _handle_firewall_dos_policy(self):
         target_model = self._get_target_model()
-        items = self._read_block()
-        # Uses ID
+        items = self._read_block() # Use default iterative version
+        multi_keys = ['srcaddr', 'dstaddr', 'service']
         for item in items:
-            item['id'] = item.get('policyid', item.get('id'))
-            multi_keys = ['srcaddr', 'dstaddr', 'service']
-            for key in multi_keys:
-                 if key in item and not isinstance(item[key], list):
-                     item[key] = [item[key]]
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:dos_policy]: Expected dict for DoS policy item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
+            item['id'] = item.get('policyid', item.get('id')) # Uses policyid
+            if not item['id']:
+                 print(f"Warning [Handler:dos_policy]: DoS Policy found without ID (policyid) near line ~{self.i}. Skipping.", file=sys.stderr)
+                 continue
+            for key in multi_keys: # Ensure lists
+                 current_val = item.get(key)
+                 if current_val is not None and not isinstance(current_val, list):
+                     item[key] = [current_val]
+                 elif current_val is None:
+                     item[key] = []
             target_model.dos_policies.append(item)
             
     _handle_firewall_dos_policy6 = _handle_firewall_dos_policy # Alias
 
     def _handle_system_snmp_sysinfo(self):
         target_model = self._get_target_model()
-        target_model.snmp_sysinfo = self._read_settings()
+        settings = self._read_settings() # Use default iterative version
+        target_model.snmp_sysinfo = settings if isinstance(settings, dict) else {}
 
     def _handle_system_snmp_community(self):
         target_model = self._get_target_model()
-        items = self._read_block()
-        # Uses ID
+        items = self._read_block() # Use default iterative version
         for item in items:
-            comm_id = item.get('id')
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:snmp_community]: Expected dict for SNMP community item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
+            comm_id = item.get('id') # Uses ID
             if comm_id:
                  # Handle nested host/host6 blocks
-                 hosts = item.get('hosts', [])
-                 item['hosts_parsed'] = [h.get('ip') for h in hosts if h.get('ip')] if isinstance(hosts, list) else []
-                 hosts6 = item.get('hosts6', [])
-                 item['hosts6_parsed'] = [h.get('ipv6') for h in hosts6 if h.get('ipv6')] if isinstance(hosts6, list) else []
+                 hosts_raw = item.get('hosts', [])
+                 item['hosts_parsed'] = [h.get('ip','?') for h in hosts_raw if isinstance(h, dict)] if isinstance(hosts_raw, list) else []
+                 hosts6_raw = item.get('hosts6', [])
+                 item['hosts6_parsed'] = [h.get('ipv6','?') for h in hosts6_raw if isinstance(h, dict)] if isinstance(hosts6_raw, list) else []
                  target_model.snmp_communities[comm_id] = item
+            else:
+                 print(f"Warning [Handler:snmp_community]: SNMP community found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_user_ldap(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:user_ldap]: Expected dict for LDAP item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
                 target_model.ldap_servers[name] = item
+            else:
+                print(f"Warning [Handler:user_ldap]: LDAP Server found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_system_admin(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:system_admin]: Expected dict for admin item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                 # Handle trusted hosts
-                 hosts = []
-                 for i in range(1, 11): # Max 10 trusted hosts
-                     ip_key = f'trusthost{i}'
-                     if ip_key in item and item[ip_key] != '0.0.0.0 0.0.0.0':
-                         if isinstance(item[ip_key], list):
-                             hosts.append(' '.join(item[ip_key]))
-                         else:
-                             hosts.append(item[ip_key])
-                 item['trusted_hosts'] = hosts
+                 # Handle trusted hosts (can be multiple 'set trusthostX' lines)
+                 item['trusted_hosts'] = []
+                 for i in range(1, 11): # Check keys trusthost1 to trusthost10
+                     th_key = f'trusthost{i}'
+                     if th_key in item:
+                         val = item.get(th_key) # Use get for safety
+                         # Value might be 'ip mask' string or list [ip, mask] from parser
+                         if isinstance(val, list) and len(val) == 2:
+                             ip_part, mask_part = val[0], val[1]
+                             # Special case: 0.0.0.0 0.0.0.0 means any
+                             if ip_part == '0.0.0.0' and mask_part == '0.0.0.0':
+                                 item['trusted_hosts'].append('any')
+                             else:
+                                 prefix = self._mask_to_prefix(mask_part)
+                                 item['trusted_hosts'].append(f"{ip_part}/{prefix}" if prefix is not None else f"{ip_part}/{mask_part}")
+                         elif isinstance(val, str) and val != '0.0.0.0 0.0.0.0':
+                              # Assume it's already formatted correctly or just an IP
+                              item['trusted_hosts'].append(val)
+                 if not item['trusted_hosts']: item['trusted_hosts'] = ['any'] # Default if none set
+
+                 # Handle VDOMs (nested block)
+                 vdoms_raw = item.get('vdom', [])
+                 item['vdoms'] = [v.get('name','?') for v in vdoms_raw if isinstance(v,dict)] if isinstance(vdoms_raw, list) else []
+
                  target_model.admins[name] = item
+            else:
+                 print(f"Warning [Handler:system_admin]: System Admin found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_system_ha(self):
         target_model = self._get_target_model()
-        target_model.ha = self._read_settings()
+        settings = self._read_settings() # Use default iterative version
+        target_model.ha = settings if isinstance(settings, dict) else {}
 
     def _handle_system_ntp(self):
         target_model = self._get_target_model()
-        target_model.ntp = self._read_settings()
+        settings = self._read_settings() # Use default iterative version
+        target_model.ntp = settings if isinstance(settings, dict) else {}
 
     def _handle_system_dns(self):
         target_model = self._get_target_model()
-        print(f"DEBUG: ENTER _handle_system_dns @ line {self.i+1}, VDOM: {self.current_vdom}") # DEBUG
-        start_i = self.i
-        settings = self._read_settings()
-        print(f"DEBUG: EXIT _read_settings in dns handler. Start i: {start_i+1}, End i: {self.i+1}, Settings found: {bool(settings)}") # DEBUG
-        target_model.dns = settings
+        settings = self._read_settings() # Use default iterative version
+        target_model.dns = settings if isinstance(settings, dict) else {}
 
     def _handle_vpn_ssl_settings(self):
-        # Typically global, but check target model just in case
-        target_model = self._get_target_model()
-        target_model.ssl_settings = self._read_settings()
+        target_model = self._get_target_model() # Typically global
+        settings = self._read_settings() # Use default iterative version
+        target_model.ssl_settings = settings if isinstance(settings, dict) else {}
 
     def _handle_vpn_ssl_web_portal(self):
         target_model = self._get_target_model()
-        items = self._read_block()
+        items = self._read_block() # Use default iterative version
         for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:ssl_portal]: Expected dict for SSL Portal item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
             name = item.get('name')
             if name:
-                # Handle bookmarks etc. if needed
+                # bookmarks, etc. are handled as nested blocks by _read_block
                 target_model.ssl_portals[name] = item
+            else:
+                print(f"Warning [Handler:ssl_portal]: SSL Web Portal found without name near line ~{self.i}. Skipping.", file=sys.stderr)
 
     def _handle_vpn_ssl_web_policy(self):
         target_model = self._get_target_model()
-        items = self._read_block()
-        # Uses ID usually? Check config. Assume 'id' or 'name'.
+        items = self._read_block() # Use default iterative version
         for item in items:
-             item['id'] = item.get('name', item.get('id')) # Prefer name if exists
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:ssl_policy]: Expected dict for SSL policy item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('id', item.get('name')) # Uses name/id? Check config
+             if not item_id:
+                  print(f"Warning [Handler:ssl_policy]: SSL Policy found without ID/Name near line ~{self.i}. Skipping.", file=sys.stderr)
+                  continue
+             item['id'] = item_id # Ensure 'id' field exists
              target_model.ssl_policies.append(item)
              
     def _handle_router_vrrp(self):
         target_model = self._get_target_model()
-        items = self._read_block() # List block 'edit <vrid>'
+        items = self._read_block() # Use default iterative version
         for item in items:
-             vrid = item.get('id') # Keyed by VRID
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:router_vrrp]: Expected dict for VRRP item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             vrid = item.get('id') # Keyed by VRID (which is the 'edit' value)
              if vrid:
                  target_model.vrrp[vrid] = item
+             else:
+                 print(f"Warning [Handler:router_vrrp]: VRRP group found without VRID near line ~{self.i}. Skipping.", file=sys.stderr)
                  
-    # --- Handler for Policy Routes ---
     def _handle_router_policy(self):
         target_model = self._get_target_model()
-        items = self._read_block() 
-        # Basic storage, can be refined later if specific fields need processing
+        items = self._read_block() # Use default iterative version
         for item in items:
-             item['id'] = item.get('seq_num', item.get('id')) # Use seq-num if available
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:router_policy]: Expected dict for PBR item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('seq_num', item.get('id')) # Use seq-num if available
+             if not item_id:
+                  print(f"Warning [Handler:router_policy]: Policy Route found without ID/SeqNum near line ~{self.i}. Skipping.", file=sys.stderr)
+                  continue
+             item['id'] = item_id # Ensure 'id' field exists
+             # Ensure multi-value fields are lists
+             multi_keys = ['input_device', 'srcaddr', 'dstaddr', 'protocol', 'service'] 
+             for key in multi_keys:
+                 current_val = item.get(key)
+                 if current_val is not None and not isinstance(current_val, list): item[key] = [current_val]
+                 elif current_val is None: item[key] = []
              target_model.policy_routes.append(item)
                  
-    # --- Settings Handlers --- 
-    # These handle simple settings blocks, often global.
-    
+    # --- Settings Handlers (Single block config) --- 
     def _handle_system_global(self):
         target_model = self._get_target_model() # Usually main model
-        target_model.system_global = self._read_settings()
+        settings = self._read_settings() # Use default iterative version
+        target_model.system_global = settings if isinstance(settings, dict) else {}
         
-    # --- Security Profile Handlers --- 
-    # These follow a common pattern: read block, store in dict by name.
+    # --- Security Profile Handlers (Common pattern) --- 
     def _handle_profile_block(self, model_key):
+         """Generic handler for profile sections (list blocks keyed by name)."""
          target_model = self._get_target_model()
-         items = self._read_block()
-         profile_dict = getattr(target_model, model_key, {}) # Get or init dict
+         items = self._read_block() # Use default iterative version
+         # Ensure the target attribute exists and is a dictionary
+         if not hasattr(target_model, model_key) or not isinstance(getattr(target_model, model_key), dict):
+              setattr(target_model, model_key, {})
+         profile_dict = getattr(target_model, model_key)
+         
          for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:profile_block for {model_key}]: Expected dict for item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
              name = item.get('name')
              if name:
                  profile_dict[name] = item
-         setattr(target_model, model_key, profile_dict) # Update model
+             else:
+                  print(f"Warning [Handler:profile_block for {model_key}]: Profile found without name near line ~{self.i}. Skipping.", file=sys.stderr)
+         # No need to setattr again unless we created the dict initially
          
     def _handle_antivirus_profile(self): self._handle_profile_block('antivirus')
     def _handle_ips_sensor(self): self._handle_profile_block('ips')
@@ -1173,26 +1711,19 @@ class FortiParser:
     def _handle_emailfilter_profile(self): self._handle_profile_block('email_filter')
     def _handle_voip_profile(self): self._handle_profile_block('voip')
     def _handle_waf_profile(self): self._handle_profile_block('waf')
-    def _handle_ssh_filter_profile(self): self._handle_profile_block('ssl_inspection') # Map to ssl? Check
+    def _handle_ssh_filter_profile(self): self._handle_profile_block('ssl_inspection') 
     def _handle_ssl_ssh_profile(self): self._handle_profile_block('ssl_inspection')
     def _handle_icap_profile(self): self._handle_profile_block('icap')
     def _handle_gtp_profile(self): self._handle_profile_block('gtp')
-    def _handle_dnsfilter_profile(self): self._handle_profile_block('system_dns_filter') # Map
+    def _handle_dnsfilter_profile(self): self._handle_profile_block('system_dns_filter') 
     def _handle_wanopt_profile(self): self._handle_profile_block('wan_opt')
     
     # --- User/Authentication Handlers ---
     def _handle_user_radius(self): self._handle_profile_block('radius_servers')
     def _handle_user_group(self): self._handle_profile_block('user_groups')
     def _handle_user_fortitoken(self): 
-         # Uses serial number as edit key
-         target_model = self._get_target_model()
-         items = self._read_block()
-         token_dict = getattr(target_model, 'fortitoken', {})
-         for item in items:
-             serial = item.get('name') # Assuming edit key stored as 'name'
-             if serial:
-                 token_dict[serial] = item
-         setattr(target_model, 'fortitoken', token_dict)
+         # Uses serial number as edit key ('name' in our parsed dict)
+         self._handle_profile_block('fortitoken') 
     def _handle_user_saml(self): self._handle_profile_block('saml')
     def _handle_user_fsso(self): self._handle_profile_block('fsso')
 
@@ -1202,30 +1733,52 @@ class FortiParser:
     def _handle_firewall_schedule_recurring(self): self._handle_profile_block('schedule_recurring')
     
     # --- Other Feature Handlers --- 
-    def _handle_firewall_sniffer(self): self._handle_profile_block('sniffer_profile') # Uses ID? Check.
-    def _handle_system_fortiguard(self): self._get_target_model().fortiguard = self._read_settings()
+    def _handle_firewall_sniffer(self): # Uses ID
+        target_model = self._get_target_model()
+        items = self._read_block() # Use default iterative version
+        if not hasattr(target_model, 'sniffer_profile') or not isinstance(getattr(target_model, 'sniffer_profile'), dict):
+             setattr(target_model, 'sniffer_profile', {})
+        profile_dict = getattr(target_model, 'sniffer_profile')
+        for item in items:
+            if not isinstance(item, dict): 
+                print(f"Warning [Handler:sniffer]: Expected dict for sniffer item, got {type(item)}. Skipping.", file=sys.stderr)
+                continue
+            item_id = item.get('id')
+            if item_id: profile_dict[item_id] = item
+            else: print(f"Warning [Handler:sniffer]: Sniffer profile found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
+
+    def _handle_system_fortiguard(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().fortiguard = settings if isinstance(settings, dict) else {}
+        
     def _handle_log_syslogd_setting(self): # Example specific log handler
          target_model = self._get_target_model()
-         settings = self._read_settings()
-         log_settings = getattr(target_model, 'log_settings', {})
-         log_settings['syslogd'] = settings # Store under a sub-key
-         setattr(target_model, 'log_settings', log_settings)
+         settings = self._read_settings() # Use default iterative version
+         if not hasattr(target_model, 'log_settings'): target_model.log_settings = {}
+         # Ensure settings is a dict before assigning
+         target_model.log_settings['syslogd'] = settings if isinstance(settings, dict) else {} 
          
-    def _handle_system_sdwan(self): # Top level SDWAN settings
+    def _handle_system_sdwan(self): # Top level SDWAN settings contains nested blocks
          target_model = self._get_target_model()
-         settings = self._read_settings()
+         settings = self._read_settings() # Use default iterative version
          # Merge settings into the main sd_wan dict
-         sdwan_config = getattr(target_model, 'sd_wan', {})
-         sdwan_config.update(settings)
-         setattr(target_model, 'sd_wan', sdwan_config)
+         if not hasattr(target_model, 'sd_wan'): target_model.sd_wan = {}
+         # Ensure settings is a dict before updating
+         if isinstance(settings, dict): target_model.sd_wan.update(settings)
+         else: print(f"Warning [Handler:sdwan]: Expected dict for SDWAN settings, got {type(settings)}. Skipping update.", file=sys.stderr)
          
-    # SD-WAN sub-configs (members, service, health-check) are handled by recursion in _read_settings
-    # when parsing _handle_system_sdwan. They will appear as nested dicts/lists within target_model.sd_wan.
-
-    def _handle_firewall_ldb_monitor(self): self._handle_profile_block('load_balance') # Store LB monitors
-    def _handle_wireless_controller_setting(self): self._get_target_model().wireless_controller = self._read_settings()
-    def _handle_switch_controller_global(self): self._get_target_model().switch_controller = self._read_settings()
-    def _handle_system_fortisandbox(self): self._get_target_model().sandbox = self._read_settings()
+    def _handle_firewall_ldb_monitor(self): self._handle_profile_block('load_balance') # Store LB monitors by name
+    def _handle_wireless_controller_setting(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().wireless_controller = settings if isinstance(settings, dict) else {}
+        
+    def _handle_switch_controller_global(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().switch_controller = settings if isinstance(settings, dict) else {}
+        
+    def _handle_system_fortisandbox(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().sandbox = settings if isinstance(settings, dict) else {}
     
     # --- Certificate Handlers --- 
     def _handle_vpn_certificate_local(self): self._handle_cert('local')
@@ -1235,71 +1788,165 @@ class FortiParser:
 
     def _handle_cert(self, cert_type):
          target_model = self._get_target_model()
-         items = self._read_block()
-         cert_dict = getattr(target_model, 'certificate', {})
-         if cert_type not in cert_dict: cert_dict[cert_type] = {}
+         items = self._read_block() # Use default iterative version
+         if not hasattr(target_model, 'certificate'): target_model.certificate = {}
+         if cert_type not in target_model.certificate: target_model.certificate[cert_type] = {}
+         cert_dict = target_model.certificate[cert_type]
          for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:cert {cert_type}]: Expected dict for cert item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
              name = item.get('name')
              if name:
-                 cert_dict[cert_type][name] = item
-         setattr(target_model, 'certificate', cert_dict)
+                 # Remove potentially large certificate content for memory? Maybe optional.
+                 # item.pop('certificate', None) 
+                 cert_dict[name] = item
+             else:
+                 print(f"Warning [Handler:cert {cert_type}]: Certificate found without name near line ~{self.i}. Skipping.", file=sys.stderr)
          
     # --- Automation/Fabric/Management Handlers ---
     def _handle_system_automation_action(self): self._handle_profile_block('automation') # Store actions by name
     def _handle_system_sdn_connector(self): self._handle_profile_block('sdn_connector')
     def _handle_system_extender_controller_extender(self): self._handle_profile_block('extender')
-    def _handle_system_csf(self): self._get_target_model().system_csf = self._read_settings()
-    def _handle_system_central_management(self): self._get_target_model().system_central_mgmt = self._read_settings()
-    def _handle_system_fm(self): self._get_target_model().system_fm = self._read_settings()
-    def _handle_log_fortianalyzer_setting(self): self._get_target_model().system_fortianalyzer = self._read_settings()
+    def _handle_system_csf(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_csf = settings if isinstance(settings, dict) else {}
+    def _handle_system_central_management(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_central_mgmt = settings if isinstance(settings, dict) else {}
+    def _handle_system_fm(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_fm = settings if isinstance(settings, dict) else {}
+    def _handle_log_fortianalyzer_setting(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_fortianalyzer = settings if isinstance(settings, dict) else {}
     _handle_system_fortianalyzer = _handle_log_fortianalyzer_setting # Alias
-    def _handle_log_fortisandbox_setting(self): self._get_target_model().system_fortisandbox = self._read_settings()
+    def _handle_log_fortisandbox_setting(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_fortisandbox = settings if isinstance(settings, dict) else {}
     _handle_system_fortisandbox = _handle_log_fortisandbox_setting # Alias
 
     # --- Legacy/Other VPN Handlers ---
-    def _handle_vpn_l2tp(self): self._get_target_model().vpn_l2tp = self._read_settings()
-    def _handle_vpn_pptp(self): self._get_target_model().vpn_pptp = self._read_settings()
+    def _handle_vpn_l2tp(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().vpn_l2tp = settings if isinstance(settings, dict) else {}
+    def _handle_vpn_pptp(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().vpn_pptp = settings if isinstance(settings, dict) else {}
     def _handle_vpn_ssl_client(self): 
          print("Warning: Parsing 'config vpn ssl client'. This section is unusual, verify structure.", file=sys.stderr)
-         # Assume settings block for now
-         self._get_target_model().vpn_ssl_client = self._read_settings()
+         settings = self._read_settings() # Use default iterative version
+         self._get_target_model().vpn_ssl_client = settings if isinstance(settings, dict) else {}
          
     # --- System Settings Handlers ---
     def _handle_system_replacemsg_group(self): self._handle_profile_block('system_replacemsg')
     def _handle_system_accprofile(self): self._handle_profile_block('system_accprofile')
     def _handle_system_api_user(self): self._handle_profile_block('system_api_user')
     def _handle_system_sso_admin(self): self._handle_profile_block('system_sso_admin')
-    def _handle_system_password_policy(self): self._get_target_model().system_password_policy = self._read_settings()
-    def _handle_firewall_interface_policy(self): self._handle_profile_block('system_interface_policy') # Treat as profile block? Needs ID?
-    def _handle_system_auto_update(self): self._get_target_model().system_auto_update = self._read_settings()
-    def _handle_system_session_ttl(self): self._get_target_model().system_session_ttl = self._read_settings()
-    # session-ttl sub-config 'port' handled by recursion
+    def _handle_system_password_policy(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_password_policy = settings if isinstance(settings, dict) else {}
+    def _handle_firewall_interface_policy(self): # Uses ID
+         target_model = self._get_target_model()
+         items = self._read_block() # Use default iterative version
+         if not hasattr(target_model, 'system_interface_policy'): setattr(target_model, 'system_interface_policy', {})
+         profile_dict = getattr(target_model, 'system_interface_policy')
+         for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:if_policy]: Expected dict for interface policy item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('id')
+             if item_id: profile_dict[item_id] = item
+             else: print(f"Warning [Handler:if_policy]: Interface policy found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
+
+    def _handle_system_auto_update(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_auto_update = settings if isinstance(settings, dict) else {}
+    def _handle_system_session_ttl(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_session_ttl = settings if isinstance(settings, dict) else {}
     def _handle_system_gre_tunnel(self): self._handle_profile_block('system_gre_tunnel')
-    def _handle_system_ddns(self): self._handle_profile_block('system_ddns') # Uses ID
+    def _handle_system_ddns(self): # Uses ID
+         target_model = self._get_target_model()
+         items = self._read_block() # Use default iterative version
+         if not hasattr(target_model, 'system_ddns'): setattr(target_model, 'system_ddns', {})
+         profile_dict = getattr(target_model, 'system_ddns')
+         for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:ddns]: Expected dict for DDNS item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('id')
+             if item_id: profile_dict[item_id] = item
+             else: print(f"Warning [Handler:ddns]: DDNS profile found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
+
     def _handle_system_dns_database(self): self._handle_profile_block('system_dns_database')
-    # dns-database sub-config 'dns-entry' handled by recursion
     def _handle_system_dns_server(self): self._handle_profile_block('system_dns_server')
-    def _handle_system_proxy_arp(self): self._handle_profile_block('system_proxy_arp') # Uses ID
+    def _handle_system_proxy_arp(self): # Uses ID
+         target_model = self._get_target_model()
+         items = self._read_block() # Use default iterative version
+         if not hasattr(target_model, 'system_proxy_arp'): setattr(target_model, 'system_proxy_arp', {})
+         profile_dict = getattr(target_model, 'system_proxy_arp')
+         for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:proxy_arp]: Expected dict for proxy ARP item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('id')
+             if item_id: profile_dict[item_id] = item
+             else: print(f"Warning [Handler:proxy_arp]: Proxy ARP found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
+
     def _handle_system_virtual_wire_pair(self): self._handle_profile_block('system_virtual_wire_pair')
-    def _handle_system_wccp(self): self._handle_profile_block('system_wccp') # Uses ID (service-id)
+    def _handle_system_wccp(self): # Uses ID (service-id)
+         target_model = self._get_target_model()
+         items = self._read_block() # Use default iterative version
+         if not hasattr(target_model, 'system_wccp'): setattr(target_model, 'system_wccp', {})
+         profile_dict = getattr(target_model, 'system_wccp')
+         for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:wccp]: Expected dict for WCCP item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('service_id')
+             if item_id: profile_dict[item_id] = item
+             else: print(f"Warning [Handler:wccp]: WCCP service found without service_id near line ~{self.i}. Skipping.", file=sys.stderr)
+
     def _handle_system_sit_tunnel(self): self._handle_profile_block('system_sit_tunnel')
     def _handle_system_ipip_tunnel(self): self._handle_profile_block('system_ipip_tunnel')
     def _handle_system_vxlan(self): self._handle_profile_block('system_vxlan')
-    # vxlan sub-config 'remote-ip' handled by recursion
     def _handle_system_geneve(self): self._handle_profile_block('system_geneve')
-    def _handle_system_network_visibility(self): self._get_target_model().system_network_visibility = self._read_settings()
-    def _handle_system_ptp(self): self._get_target_model().system_ptp = self._read_settings()
-    def _handle_system_tos_based_priority(self): self._handle_profile_block('system_tos_based_priority') # Uses ID
-    def _handle_system_email_server(self): self._get_target_model().system_email_server = self._read_settings()
-    def _handle_ips_urlfilter_dns(self): self._get_target_model().system_ips_urlfilter_dns = self._read_settings() # Settings? Check format.
+    def _handle_system_network_visibility(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_network_visibility = settings if isinstance(settings, dict) else {}
+    def _handle_system_ptp(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_ptp = settings if isinstance(settings, dict) else {}
+    def _handle_system_tos_based_priority(self): # Uses ID
+         target_model = self._get_target_model()
+         items = self._read_block() # Use default iterative version
+         if not hasattr(target_model, 'system_tos_based_priority'): setattr(target_model, 'system_tos_based_priority', {})
+         profile_dict = getattr(target_model, 'system_tos_based_priority')
+         for item in items:
+             if not isinstance(item, dict): 
+                 print(f"Warning [Handler:tos_prio]: Expected dict for ToS prio item, got {type(item)}. Skipping.", file=sys.stderr)
+                 continue
+             item_id = item.get('id')
+             if item_id: profile_dict[item_id] = item
+             else: print(f"Warning [Handler:tos_prio]: ToS Priority found without ID near line ~{self.i}. Skipping.", file=sys.stderr)
+
+    def _handle_system_email_server(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_email_server = settings if isinstance(settings, dict) else {}
+    def _handle_ips_urlfilter_dns(self): 
+        settings = self._read_settings() # Use default iterative version
+        self._get_target_model().system_ips_urlfilter_dns = settings if isinstance(settings, dict) else {}
 
     # --- Generic Handler --- 
-    def _handle_generic_section(self, raw_section_name, normalized_section_name):
+    def _handle_generic_section(self, raw_section_name, normalized_section_name, block_start_content_index):
         """Handles unrecognized config sections by storing raw data."""
         target_model = self._get_target_model()
-        # print(f"Info: Using generic handler for section: {raw_section_name}")
+        # Set parser position to start of block content
+        self.i = block_start_content_index 
+        
         # Decide if it's likely a list block or settings block by peeking ahead
-        peek_i = self.i + 1
+        peek_i = self.i # Start peeking from the first content line
         is_list_block = False
         while peek_i < len(self.lines):
             peek_line = self.lines[peek_i].strip()
@@ -1308,321 +1955,104 @@ class FortiParser:
                 continue
             if self.EDIT_RE.match(peek_line):
                 is_list_block = True
-            break
+            break # Found first significant line, decision made
             
         data = None
         try:
             if is_list_block:
-                # print(f"DEBUG: Generic handler reading '{raw_section_name}' as list block.")
-                data = self._read_block()
+                if self.debug: print(f"DEBUG: Generic handler reading '{raw_section_name}' as list block.")
+                data = self._read_block() # Use default iterative version
             else:
-                # print(f"DEBUG: Generic handler reading '{raw_section_name}' as settings block.")
-                data = self._read_settings()
+                if self.debug: print(f"DEBUG: Generic handler reading '{raw_section_name}' as settings block.")
+                data = self._read_settings() # Use default iterative version
         except Exception as e:
-            print(f"ERROR: Generic handler failed for section '{raw_section_name}' at line {self.i+1}: {e}", file=sys.stderr)
-            # Attempt to recover by skipping
-            # Reset self.i to the start of the block before skipping
-            # Find the line number where the section started (tricky without storing it)
-            # Simplification: assume self.i is roughly correct before skip attempt
-            self._skip_block()
+            print(f"ERROR: Generic handler failed for section '{raw_section_name}' starting near line {block_start_content_index}: {e}", file=sys.stderr)
+            # Attempt to recover by skipping the block - reset i first
+            self.i = block_start_content_index 
+            self._skip_to_next_block_or_end() # Try skipping
             data = f"Error parsing section: {e}" # Store error marker
             
         # Store the data in the model under a generic key
-        generic_data = getattr(target_model, 'generic_configs', {})
+        if not hasattr(target_model, 'generic_configs'): target_model.generic_configs = {}
         # Use normalized name, maybe prefix to avoid clashes?
         storage_key = f"generic_{normalized_section_name}"
-        generic_data[storage_key] = {
+        # Store raw name too for reference
+        target_model.generic_configs[storage_key] = {
              'raw_name': raw_section_name,
              'data': data
         }
-        setattr(target_model, 'generic_configs', generic_data)
-        # print(f"Stored generic data for {raw_section_name} under key {storage_key}")
+        if self.debug: print(f"Stored generic data for {raw_section_name} under key {storage_key}")
 
-# --- Main Execution --- 
+# --- Recovery Helper ---
+    def _skip_to_next_block_or_end(self):
+        """
+        When an error occurs during parsing (e.g., in a handler), this method attempts
+        to find the 'end' of the current problematic block or the start of the next
+        'config' section. This allows the parser to recover and continue processing
+        the rest of the file.
 
-def main():
-    p = argparse.ArgumentParser(description="FortiGate Comprehensive Table Parser & Diagram Generator")
-    p.add_argument('config_file', help="FortiGate CLI export text file")
-    p.add_argument('--output', default='network_topology', help="Base name for output files (diagrams, reports)")
-    # Path Tracing Arguments
-    p.add_argument('--trace-src', help="Source IP address for path trace")
-    p.add_argument('--trace-dst', help="Destination IP address for path trace")
-    p.add_argument('--trace-port', help="Destination port/service for path trace (required if src/dst provided)")
-    p.add_argument('--trace-proto', default='tcp', help="Protocol for path trace (tcp, udp, icmp - default: tcp)")
-    # Output format arguments (optional)
-    p.add_argument('--no-diagram', action='store_true', help="Skip diagram generation")
-    p.add_argument('--no-tables', action='store_true', help="Skip printing ASCII tables to console")
-    # ADDED Debug argument
-    p.add_argument('--debug', action='store_true', help="Enable verbose debug output during parsing")
+        It assumes self.i currently points to the line *containing* the error or
+        the 'config' line of the block where the error occurred.
 
-    args = p.parse_args()
+        Returns:
+            bool: True if a potential recovery point ('end' or new 'config') was found,
+                  False if recovery failed (e.g., reached EOF).
+        """
+        recovery_start_line = self.i + 1
+        if self.debug: print(f"Recovery: Attempting to skip block starting near line {recovery_start_line}...")
 
-    try:
-        # Read the entire config file
-        with open(args.config_file, 'r', encoding='utf-8') as f:
-             config_lines = f.readlines()
-    except OSError as e:
-        print(f"Error opening config file '{args.config_file}': {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-         print(f"Error reading config file '{args.config_file}': {e}", file=sys.stderr)
-         sys.exit(1)
+        # Initial nesting level: Assume we are just inside the problematic block's 'config' line.
+        # This might be inaccurate if the error happened deep inside, but it's a starting point.
+        # A more robust approach might involve tracking depth in the main loop, but adds complexity.
+        nesting_level = 1
+        self.i += 1 # Move past the assumed problematic 'config' or error line
 
-    print(f"Parsing configuration file: {args.config_file}...")
-    # Pass debug flag to parser
-    parser = FortiParser(config_lines, debug=args.debug)
-    try:
-        model = parser.parse()
-        # Removed redundant print("Parsing complete.") here, moved inside parse()
-    except Exception as e:
-        print(f"\n!!! Critical parsing error encountered: {e}", file=sys.stderr)
-        print("Attempting to proceed, but results may be incomplete.", file=sys.stderr)
+        while self.i < len(self.lines):
+            line = self.lines[self.i].strip()
+            original_line_index = self.i # For logging
 
-    # --- Initialize Generator --- 
-    # Requires the parsed model
-    generator = NetworkDiagramGenerator(model)
+            # Log the line being processed during recovery
+            if self.debug: print(f"  RecoverySkip [L{original_line_index + 1}, NestLvl:{nesting_level}]: Processing line: '{line}'")
 
-    # --- Conditional Execution: Trace or Tables/Diagram ---
-    if args.trace_src and args.trace_dst:
-        if not args.trace_port:
-             print("Error: --trace-port is required when using --trace-src and --trace-dst.", file=sys.stderr)
-             sys.exit(1)
+            # Check for markers that signify the end of the current block or start of a new one
 
-        print(f"\n--- Performing Network Path Trace ---")
-        print(f"Source:      {args.trace_src}")
-        print(f"Destination: {args.trace_dst}")
-        print(f"Port:        {args.trace_port}")
-        print(f"Protocol:    {args.trace_proto}")
-        print("-" * 35)
+            # 1. Is it a new top-level config section? (Implicit end of current block)
+            if self.SECTION_RE.match(line) or \
+               self.VDOM_CONFIG_RE.match(line) or \
+               self.GLOBAL_CONFIG_RE.match(line):
+                if self.debug: print(f"  RecoverySkip: Found new section start at line {original_line_index + 1}. Ending skip.")
+                # DO NOT advance self.i here. Let the main loop process this new 'config' line.
+                return True
 
-        # Run the trace using the generator's method
-        try:
-            path_result, status_msg = generator.trace_network_path(
-                source_ip=args.trace_src,
-                dest_ip=args.trace_dst,
-                dest_port=args.trace_port,
-                protocol=args.trace_proto
-            )
-        except Exception as e:
-             print(f"\n!!! Error during path trace execution: {e}", file=sys.stderr)
-             print("Please check the trace parameters and the parsed configuration.", file=sys.stderr)
-             sys.exit(1)
+            # 2. Does it look like an 'end' command?
+            if self.END_RE.match(line):
+                nesting_level -= 1
+                if self.debug: print(f"  RecoverySkip: Found 'end' at line {original_line_index + 1}. New nesting level: {nesting_level}")
+                if nesting_level == 0:
+                    # We likely found the matching 'end' for the block we started skipping.
+                    self.i += 1 # Consume the 'end' line
+                    if self.debug: print(f"  RecoverySkip: Found matching 'end' at line {original_line_index + 1}. Skip successful.")
+                    return True
+                elif nesting_level < 0:
+                    # We found an 'end' but our nesting count is off (possibly extra 'end' or nested error)
+                    # It's safer to stop skipping and let the main loop handle this 'end'.
+                    print(f"Warning [Line {original_line_index + 1}]: Recovery skip found 'end' resulting in nesting level {nesting_level}. "
+                          f"Stopping skip to let main loop handle potential extra 'end' or parent block end.", file=sys.stderr)
+                    # DO NOT advance self.i here. Let the main loop process this potentially problematic 'end'.
+                    return True
 
-        # Print the trace results
-        print(f"\n--- Trace Result ---")
-        print(f"Status: {status_msg}")
-        if path_result:
-            print("\nPath Details (Simulated Hops):")
-            for hop_info in path_result:
-                 print(f"  Hop {hop_info.get('hop')}: [{hop_info.get('type')}]")
-                 # Print relevant details based on type
-                 details_to_print = []
-                 if 'detail' in hop_info: details_to_print.append(f"    Detail: {hop_info['detail']}")
-                 if 'interface' in hop_info: details_to_print.append(f"    Interface: {hop_info['interface']}")
-                 if 'policy_id' in hop_info and hop_info['policy_id']: details_to_print.append(f"    Policy ID: {hop_info['policy_id']}")
-                 if 'egress_interface' in hop_info: details_to_print.append(f"    Egress IF: {hop_info['egress_interface']}")
-                 if 'post_nat_src' in hop_info and hop_info['pre_nat_src'] != hop_info['post_nat_src']: details_to_print.append(f"    NAT Src: {hop_info['pre_nat_src']} -> {hop_info['post_nat_src']}")
-                 if 'post_nat_dst' in hop_info and hop_info['pre_nat_dst'] != hop_info['post_nat_dst']: details_to_print.append(f"    NAT Dst: {hop_info['pre_nat_dst']} -> {hop_info['post_nat_dst']}")
-                 if 'post_nat_port' in hop_info and hop_info['pre_nat_port'] != hop_info['post_nat_port']: details_to_print.append(f"    NAT Port: {hop_info['pre_nat_port']} -> {hop_info['post_nat_port']}")
-                 print("\n".join(details_to_print))
-        print("-" * 20)
+            # 3. Does it look like the start of a *nested* 'config' section?
+            if self.SECTION_RE.match(line): # Re-use SECTION_RE, nested configs look the same
+                 nesting_level += 1
+                 if self.debug: print(f"  RecoverySkip: Found nested 'config' at line {original_line_index + 1}. New nesting level: {nesting_level}")
 
-    else:
-        # --- Default Behavior: Generate Diagram & Reports --- 
-        print("\n--- Generating Reports and Diagram --- ")
+            # Advance to the next line if none of the above matched
+            self.i += 1
+
+        # If loop finishes, we reached EOF without finding a clear end/next block
+        print(f"Warning: Recovery skip reached EOF while searching from line {recovery_start_line}.", file=sys.stderr)
+        return False
         
-        # Generate diagram (and reports) using the generator
-        if not args.no_diagram:
-             try:
-                 # This method now handles analysis, rendering, unused report, and summary
-                 generator.generate_diagram(args.output)
-             except ImportError as e:
-                  print(f"\nError: Failed to import required library for diagrams: {e}", file=sys.stderr)
-                  print("Please ensure 'graphviz' Python library and the Graphviz binaries are installed.", file=sys.stderr)
-             except Exception as e:
-                  print(f"\n!!! Error during diagram/report generation: {e}", file=sys.stderr)
-        else:
-             print("Skipping diagram generation as requested.")
-             # Need to run analysis manually if diagram is skipped but we want reports/tree
-             try:
-                 generator.analyze_relationships()
-                 # Generate reports even if diagram skipped
-                 # generator.generate_unused_report(args.output)
-                 # summary = generator.generate_relationship_summary()
-                 # print("\n" + summary)
-             except Exception as e:
-                 print(f"\n!!! Error during analysis for reports: {e}", file=sys.stderr)
-
-        # --- Generate and Print Connectivity Tree --- 
-        # Print this regardless of --no-tables, as it provides different info
-        try:
-            connectivity_tree_output = generator.generate_connectivity_tree()
-            print("\n" + connectivity_tree_output)
-        except Exception as e:
-             print(f"\n!!! Error generating connectivity tree: {e}", file=sys.stderr)
-
-        # --- Optional: Print ASCII Tables --- 
-        if not args.no_tables:
-            print("\n--- Generating Console Tables (Summary) --- ")
-            # Static Routes
-            rows = [[r.get('name','-'), r.get('dst','-'), r.get('gateway','-'), r.get('device','-'),
-                     r.get('distance','-'), 'Yes' if r.get('status') != 'disable' else 'No', r.get('comment','-')]
-                    for r in model.routes]
-            print_table("Static Routes", ["Name","Destination","Gateway","Interface","Distance","Enabled","Comment"], rows)
-            
-            # Interfaces
-            rows = [[n, i.get('ip','DHCP/Unset'), i.get('type','physical'), ','.join(i.get('allowaccess',[])),
-                     i.get('role','undefined'), i.get('vdom','root'), i.get('alias','-'), 
-                     i.get('status','unknown')]
-                    for n,i in model.interfaces.items()]
-            print_table("Interfaces", ["Name","IP/Mask","Type","Access","Role","VDOM","Alias","Status"], rows)
-
-            # Zones
-            rows = [[n, ','.join(z.get('interface',[])), z.get('intrazone','deny')]
-                    for n,z in model.zones.items()]
-            print_table("Zones", ["Name","Interfaces","Intrazone Action"], rows)
-            
-            # Policies (simplified table)
-            rows = []
-            for p in model.policies:
-                nat_info = 'No NAT'
-                if p.get('nat') == 'enable':
-                     nat_info = f"NAT: Outgoing IF" if p.get('ippool') != 'enable' else f"NAT Pool: {p.get('poolname', '?')}"
-                rows.append([
-                     p.get('id','?'), ','.join(p.get('srcintf',[])), ','.join(p.get('dstintf',[])),
-                     ','.join(p.get('srcaddr',[])), ','.join(p.get('dstaddr',[])),
-                     ','.join(p.get('service',[])), p.get('action','deny'),
-                     'Yes' if p.get('status') != 'disable' else 'No', nat_info,
-                     p.get('logtraffic','off')
-                 ])
-            print_table("Firewall Policies (Summary)", ["ID","SrcIntf","DstIntf","SrcAddr","DstAddr","Service","Action","Enabled","NAT","Log"], rows)
-            
-            # Address Objects
-            rows = [[n, a.get('type','?'), a.get('subnet','?'), a.get('comment','-')]
-                    for n,a in model.addresses.items()]
-            print_table("Address Objects", ["Name","Type","Subnet/FQDN/Range","Comment"], rows)
-
-            # Address Groups
-            rows = [[n, ','.join(m)] for n,m in model.addr_groups.items()]
-            print_table("Address Groups", ["Name","Members"], rows)
-            
-            # Custom Services
-            rows = []
-            for n, s in model.services.items():
-                 port_info = s.get('port', 'any')
-                 # Handle potential list format for ports from older parsing logic if needed
-                 if isinstance(port_info, list): port_info = ' '.join(port_info)
-                 rows.append([n, s.get('protocol','?'), port_info, s.get('comment','-')])
-            print_table("Custom Services", ["Name","Protocol","Port Range/Info","Comment"], rows)
-
-            # Service Groups
-            rows = [[n, ','.join(m)] for n,m in model.svc_groups.items()]
-            print_table("Service Groups", ["Name","Members"], rows)
-
-            # VIPs (Virtual IPs)
-            rows = []
-            for n, v in model.vips.items():
-                 extip = v.get('extip','?')
-                 mappedip_list = v.get('mappedip', [])
-                 # Ensure mappedip is always treated as a list for consistency
-                 if not isinstance(mappedip_list, list): mappedip_list = [mappedip_list] 
-                 mappedip_str = ', '.join([m.get('range', '?') for m in mappedip_list]) if mappedip_list else '?'
-                 
-                 portfwd = 'No'
-                 fwd_details = []
-                 if v.get('portforward') == 'enable':
-                     portfwd = 'Yes'
-                     fwd_details.append(f"Proto: {v.get('protocol', '?')}")
-                     fwd_details.append(f"Ext: {v.get('extport', '?')}")
-                     fwd_details.append(f"Mapped: {v.get('mappedport', '?')}")
-                     portfwd = f"Yes ({', '.join(fwd_details)})"
-
-                 rows.append([n, extip, mappedip_str, v.get('extintf','any'), portfwd, v.get('comment','-')])
-            print_table("VIPs (Virtual IPs)", ["Name","External IP","Mapped IP(s)","Interface","Port Fwd","Comment"], rows)
-
-            # VIP Groups
-            rows = [[n, ','.join(m)] for n,m in model.vip_groups.items()]
-            print_table("VIP Groups", ["Name","Members"], rows)
-
-            # IP Pools
-            rows = [[n, p.get('type','overload'), f"{p.get('startip','?')} - {p.get('endip','?')}", p.get('comment','-')]
-                    for n,p in model.ippools.items()]
-            print_table("IP Pools", ["Name","Type","IP Range","Comment"], rows)
-
-            # VPN Phase 1
-            rows = []
-            for n, p1 in model.phase1.items():
-                rows.append([n, p1.get('interface','-'), p1.get('remote_gw','-'), 
-                             p1.get('psksecret','*SECRET*'), p1.get('proposal','default'),
-                             p1.get('mode','main'), p1.get('status','enable')])
-            print_table("VPN Phase 1", ["Name","Interface","Remote GW","PSK","Proposal","Mode","Status"], rows)
-
-            # VPN Phase 2
-            rows = []
-            for n, p2 in model.phase2.items():
-                src_sel = f"{p2.get('src_subnet','0.0.0.0/0')} ({p2.get('src_addr_type','subnet')})" if p2.get('src_subnet') else p2.get('src_name', '-')
-                dst_sel = f"{p2.get('dst_subnet','0.0.0.0/0')} ({p2.get('dst_addr_type','subnet')})" if p2.get('dst_subnet') else p2.get('dst_name', '-')
-                rows.append([n, p2.get('phase1name','-'), src_sel, dst_sel, 
-                             p2.get('proposal','default'), 'Yes' if p2.get('auto_negotiate')=='enable' else 'No',
-                             p2.get('keylifeseconds','-')])
-            print_table("VPN Phase 2", ["Name","Phase1 Name","Source Selector","Dest Selector","Proposal","Auto Neg.","Keylife (s)"], rows)
-            
-            # DHCP Servers
-            rows = []
-            for s in model.dhcp_servers:
-                 rows.append([s.get('id','-'), s.get('interface','-'), s.get('ip_range_str','-'),
-                              s.get('default_gateway','-'), s.get('netmask','-'), s.get('dns_service','default')])
-            print_table("DHCP Servers", ["ID","Interface","IP Range","Gateway","Netmask","DNS"], rows)
-
-            # System DNS
-            rows = [[model.dns.get('primary','-'), model.dns.get('secondary','-'), model.dns.get('domain','-')]] if model.dns else []
-            print_table("System DNS", ["Primary","Secondary","Domain"], rows)
-            
-            # System NTP
-            ntp_enabled = model.ntp.get('ntpsync') == 'enable'
-            server_mode = model.ntp.get('type','fortiguard')
-            server_details = model.ntp.get('ntpserver','FortiGuard Servers') if server_mode == 'fortiguard' else model.ntp.get('server','?')
-            rows = [['Yes' if ntp_enabled else 'No', server_mode, server_details]] if model.ntp else []
-            print_table("System NTP", ["Enabled","Mode","Server(s)"], rows)
-            
-            # Administrators
-            rows = []
-            for n, a in model.admins.items():
-                 # Format trusted hosts
-                 trusted_hosts_raw = a.get('trusted_hosts', [])
-                 trusted_hosts_formatted = []
-                 if trusted_hosts_raw:
-                     for host_entry in trusted_hosts_raw:
-                         if isinstance(host_entry, list):
-                             trusted_hosts_formatted.append(' '.join(host_entry)) # Rejoin IP and mask
-                         elif isinstance(host_entry, str):
-                             trusted_hosts_formatted.append(host_entry)
-                         # else: ignore unexpected types in the list
-                     trusted_display = ', '.join(trusted_hosts_formatted) 
-                 else:
-                     trusted_display = 'Any'
-                 
-                 # Format VDOMs
-                 vdoms_raw = a.get('vdoms')
-                 vdom_display = ','.join(vdoms_raw) if isinstance(vdoms_raw, list) else (vdoms_raw if vdoms_raw else '-') # Handle list or single string
-
-                 rows.append([n, a.get('accprofile','-'), trusted_display, vdom_display])
-            print_table("Administrators", ["Name","Access Profile","Trusted Hosts","VDOMs"], rows)
-
-            # Security Profiles (List Names)
-            rows = [[n, p.get('comment', '-'), 'Yes' if p.get('botnet_c_c_scan') == 'enable' else 'No'] for n, p in model.antivirus.items()]
-            print_table("Antivirus Profiles", ["Name", "Comment", "Botnet C&C Scan"], rows)
-            rows = [[n, p.get('comment', '-'), 'Enabled' if p.get('status') == 'enable' else 'Disabled'] for n, p in model.ips.items()]
-            print_table("IPS Sensors", ["Name", "Comment", "Status"], rows)
-            rows = [[n, p.get('comment', '-'), p.get('fortiguard_category', '?')] for n, p in model.web_filter.items()]
-            print_table("Web Filter Profiles", ["Name", "Comment", "FortiGuard Category Action"], rows)
-            rows = [[n, p.get('comment', '-'), 'Yes' if p.get('block_malicious_applications') == 'enable' else 'No'] for n, p in model.app_control.items()]
-            print_table("Application Control Profiles", ["Name", "Comment", "Block Malicious Apps"], rows)
-
-        else:
-            print("Skipping console table generation.")
-            
-    print("\nProcessing finished.")
-
-if __name__ == '__main__':
-    main()
+# --- Main Execution --- 
+# (Keep main execution block as is)
+# ... (rest of the file from main() onwards) ...
