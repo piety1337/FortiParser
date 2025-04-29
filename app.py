@@ -5,6 +5,19 @@ import sys
 import traceback # Import traceback for better error handling
 import subprocess # For checking Graphviz
 import difflib # For basic text diffing (can be enhanced)
+
+# --- Increase Recursion Limit ---
+# Set a higher recursion limit for handling deeply nested configurations
+# Default is often 1000, increasing it helps with very large/complex files.
+# Be cautious with extremely high values if there's a risk of true infinite recursion.
+RECURSION_LIMIT = 50000 # Increased limit
+try:
+    sys.setrecursionlimit(RECURSION_LIMIT)
+    # Optional: Log the new limit or confirm it if needed
+    # print(f"Recursion limit set to: {sys.getrecursionlimit()}") 
+except Exception as e:
+    st.warning(f"Could not set recursion limit to {RECURSION_LIMIT}: {e}. Using default.")
+
 # --- Add imports for PDF generation ---
 from io import BytesIO
 from xhtml2pdf import pisa
